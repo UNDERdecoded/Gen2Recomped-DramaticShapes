@@ -28,6 +28,8 @@ local DayNight = V.require("DayNight")
 local FirstPerson = V.require("FirstPerson")
 local BattleBillboard = V.require("BattleBillboard")
 local Pokedex = V.require("Pokedex")
+local WorldUnderlay = V.require("WorldUnderlay")
+local WorldFillProps = V.require("WorldFillProps")
 local PaletteFX = require("src.render.PaletteFX")
 local Map = require("src.world.Map")
 
@@ -991,10 +993,23 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   -- about anything but their viewpoint.
   local function drawScene()
 
+  -- The world beyond the authored maps: a flat fill (CYAN/BLACK), nothing
+  -- (OFF/KFP hands the horizon to another mod), or NATURE's biome billboards.
+  -- Resolved before the terrain so a color fill covers everything drawn after.
+  local underlayColor = WorldUnderlay.resolve(state, modeColors(paletteFor, state.map))
+
   Voxel3D.draw(terrain, atlasFor(state.map), nil)
   for i, nb in ipairs(state.neighbors or {}) do
     Voxel3D.draw(nbMesh[i], atlasFor(nb.map),
                  Mat4.translate(nb.ox, 0, nb.oy))
+  end
+
+  -- Trees or rocks continue the authored route beyond its finite mesh. They
+  -- stand only on world cells outside the root/connected-map rectangles,
+  -- so no billboard can poke through valid terrain or block the player.
+  WorldFillProps.draw(state, cx, cy, vw, vh)
+  if underlayColor then
+    WorldUnderlay.draw(state, cx, cy, underlayColor)
   end
 
   -- Without a shadow map (headless, or a driver that could not make the

@@ -500,6 +500,14 @@ function ShadowMap.finish(sig)
   ready = true
 end
 
+-- A flat battle plate has no world receiver. Keep cached GPU allocations but
+-- make the next scene bind the blank shadow sampler rather than stale terrain.
+function ShadowMap.discard()
+  if drawing then return end
+  lastSig = nil
+  ready = false
+end
+
 -- Drop the GPU objects (window resize, hot reload).
 function ShadowMap.invalidate()
   canvas, canvasRes, blank = nil, 0, nil

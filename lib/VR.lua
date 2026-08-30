@@ -679,10 +679,10 @@ function VR.update(dt)
     if VRXR.start(qw, qh) then
       started = true
       status = "session created"
-      print("[DRAMATIC_SHAPE] VR: " .. VRXR.status())
+      print("[BATTLE_ART_VOXEL_GEN2] VR: " .. VRXR.status())
     else
       failed = VRXR.status()
-      print("[DRAMATIC_SHAPE] VR unavailable: " .. failed
+      print("[BATTLE_ART_VOXEL_GEN2] VR unavailable: " .. failed
             .. " -- fix that, then toggle the VR row to retry")
       return
     end

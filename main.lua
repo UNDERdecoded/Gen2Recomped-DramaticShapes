@@ -49,11 +49,11 @@ local V = { mod = mod, path = mod.path }
 local function chunkFor(rel)
   local source = mod:read(rel)
   if not source then
-    error(("DRAMATIC_SHAPE: %s is missing -- reinstall the mod"):format(rel), 0)
+    error(("BATTLE_ART_VOXEL_GEN2: %s is missing -- reinstall the mod"):format(rel), 0)
   end
   local chunk, err = load(source, "@" .. mod.path .. "/" .. rel)
   if not chunk then
-    error(("DRAMATIC_SHAPE: %s did not compile: %s"):format(rel, tostring(err)), 0)
+    error(("BATTLE_ART_VOXEL_GEN2: %s did not compile: %s"):format(rel, tostring(err)), 0)
   end
   return chunk
 end
@@ -91,10 +91,18 @@ local VoxelGrid = V.require("VoxelGrid")
 local WorldCurve = V.require("WorldCurve")
 local OverworldBattle = V.require("OverworldBattle")
 local BattleExit = V.require("BattleExit")
+local BattleArt = V.require("BattleArt")
+local AnimatedBattleArt = V.require("AnimatedBattleArt")
+local InterfaceSprites = V.require("InterfaceSprites")
+local WorldUnderlay = V.require("WorldUnderlay")
+local UiBackplates = V.require("UiBackplates")
+local BattleStage = V.require("BattleStage")
+local BattlePresentation = V.require("BattlePresentation")
 local DayNight = V.require("DayNight")
 local DayTint = V.require("DayTint")
 local Water = V.require("Water")
 local AntiAlias = V.require("AntiAlias")
+local WorldCanvasOrientation = V.require("WorldCanvasOrientation")
 local FirstPerson = V.require("FirstPerson")
 local FreeMove = V.require("FreeMove")
 local CamControl = V.require("CamControl")
@@ -286,13 +294,15 @@ mod.content.render_pipelines:register("voxel", {
     end
     -- and back to the window's own size, which is what the engine composites
     -- one canvas pixel to one display pixel.  A pass-through when AA is off.
-    return AntiAlias.resolve(canvas, sw, sh, "world")
+    canvas = AntiAlias.resolve(canvas, sw, sh, "world")
+    return WorldCanvasOrientation.present(canvas, "overworld")
   end,
 
   invalidate = function()
     Voxel3D.invalidate()
     OverworldBattle.invalidate()
     AntiAlias.invalidate()
+    WorldCanvasOrientation.invalidate()
     ChunkMesher.invalidate()   -- no map id = every cached mesh
     VR.invalidate()            -- the mirror, and FBO ids of dead canvases
   end,
@@ -429,15 +439,115 @@ local SETTINGS = {
     "Fight on the map: the battle draws over the nearest clear ground, "
     .. "shot over the shoulder with a slow parallax drift.",
     when = function() return not VR.enabled() end, full = true },
-  -- Only offered while a fight can actually be staged on the map: with 3D-BTL
-  -- off the engine draws the classic screen, which is this row's ON already,
-  -- and a row that no longer decides anything is worse than no row.
+  -- Advanced compatibility control, kept off the in-game menu because it
+  -- pins the player pic to the UI camera and applies the world's night tint,
+  -- overriding the staged camera and SPRITE LIGHT presentation controls.
   { OverworldBattle.backSetting,
     "Keep your own Pokemon on the battle menu, seen from behind in its "
     .. "original slot, instead of standing it on the map facing the foe. "
     .. "The foe is still out there on its own tile.",
     when = function() return stagedBattles() and not VR.enabled() end,
+    full = true, managerOnly = true },
+  -- Battle Art rows (ported from the Gen1 fork). Only offered while a fight
+  -- can actually be staged on the map.
+  { BattleArt.setting,
+    "Use optional PNGs from assets/battle in fights. Missing art falls "
+    .. "back to the ROM. ANIMATED is the tested fresh-install default.",
+    when = function() return stagedBattles() end, full = true },
+  { BattleArt.trainerSetting,
+    "Use the ROM opponent trainers, or choose an optional static collection. "
+    .. "A class missing from that collection falls back to its ROM portrait.",
+    when = function()
+      return stagedBattles() and BattleArt.setting:get() ~= "rom"
+    end, full = true, managerOnly = true },
+  { BattleArt.playerArtSetting,
+    "Choose the player trainer's static battle-intro portrait. A missing "
+    .. "named choice tries player.png, then ROM. PNG uses player.png "
+    .. "directly. BATTLE ART: ROM pins this row to ROM.",
+    when = function()
+      return stagedBattles() and BattleArt.setting:get() == "static"
+    end, full = true },
+  { BattleArt.playerAnimationSetting,
+    "Choose the player trainer's battle-intro art under ANIMATED. PNG uses "
+    .. "player.png as a static portrait; named sets play their authored "
+    .. "slide poses once. Missing art and ROM retain the engine portrait.",
+    when = function()
+      return stagedBattles() and BattleArt.setting:get() == "animated"
+    end, full = true },
+  { BattleArt.frontAnimationSetting,
+    "Choose the front generation used by BATTLE ART: ANIMATED. GEN 1 reads "
+    .. "single-frame PNGs; GEN 2-5 read atlases. STATIC ignores this row. "
+    .. "Missing art falls directly back to ROM.",
+    when = function()
+      return stagedBattles() and BattleArt.setting:get() == "animated"
+    end, full = true },
+  { BattleArt.backAnimationSetting,
+    "Choose the player back-art generation. STATIC reads only a PNG from "
+    .. "back-static/GEN for every choice. ANIMATED reads static GEN 1, 2, "
+    .. "and 4 PNGs, or animated GEN 3 and 5 atlases. Missing art falls "
+    .. "back to the ROM.",
+    when = function() return stagedBattles() and BattleArt.setting:get() ~= "rom"
+    end, full = true },
+  { BattleArt.duplicateSetting,
+    "Choose who owns Pokemon pictures when another sprite mod is installed. "
+    .. "BATTLE ART keeps this mod's selected front and back collections on "
+    .. "top, including its DV-routed shiny collections. MODDED installs no "
+    .. "Pokemon art and captures the pictures chosen by another sprite mod "
+    .. "or the ROM on both sides.",
+    when = function() return stagedBattles() end, full = true },
+  { BattleArt.viewSetting,
+    "Show the player's Pokemon from the front or back. Supplied art stays "
+    .. "world-placed; a missing selected back falls back to the ROM UI pic.",
+    when = function() return stagedBattles() end, full = true },
+  { BattleArt.frontFlipSetting,
+    "Orient the player-side FRONT SPRITES card. BATTLE ART mirrors ordinary "
+    .. "front art so it faces the opponent. DEFAULT preserves the image's "
+    .. "authored direction, for sprite mods that already supply a flipped "
+    .. "player picture such as Crystal Animated Sprites.",
+    when = function()
+      return stagedBattles() and BattleArt.playerSide() == "front"
+    end, full = true },
+  { UiBackplates.spriteLight,
+    "SHADED lets the mons receive the world's day tint and cast shadows; "
+    .. "UNLIT draws them flat and full bright. UNLIT is what the OG "
+    .. "battle's sprites look like.",
+    when = function() return stagedBattles() end, full = true },
+  { UiBackplates.hudColor,
+    "INVERTED uses bright white HUD ink over the arena; COLOR keeps the "
+    .. "engine's black ink. HP and EXP bars retain their native colors.",
+    when = function() return stagedBattles() end, full = true },
+  { UiBackplates.arenaFill,
+    "Choose the staged battle background: the voxel world, a flat white "
+    .. "field, or assets/battle/front-static/bosses/arena.png.",
+    when = function() return stagedBattles() end, full = true },
+  { UiBackplates.backdropOffset,
+    "Crop the selected PNG arena downward in source-image pixels.",
+    when = function()
+      return stagedBattles() and UiBackplates.arenaPng()
+    end, full = true },
+  { UiBackplates.bossBg,
+    "Allow encounter-specific boss artwork to override an illustrated arena.",
+    full = true, managerOnly = true },
+  { UiBackplates.textboxFill,
+    "Choose opaque white, translucent dark, opaque black, or paperless "
+    .. "battle text boxes.",
+    when = function() return stagedBattles() end, full = true },
+  { InterfaceSprites.setting,
+    "INTERFACE SPRITES: show BATTLE ART's regular-form FRONT outside battle. "
+    .. "Title and status support timed atlas animation; other hook-aware "
+    .. "screens use single-image sets or retain ROM art, independent of "
+    .. "DUPLICATE FIX (which owns only battle pictures). "
+    .. "MODDED leaves the interfaces to another sprite mod or the ROM.",
     full = true },
+  { WorldUnderlay.setting,
+    "Choose the solid outdoor world beneath terrain holes and beyond map edges: "
+    .. "CYAN or BLACK. OFF/KFP leaves the underlay to Kanto First Person. "
+    .. "NATURE uses a black underlay and continues each biome beyond loaded "
+    .. "ROM cells with stable random-sized tree or rock billboards. "
+    .. "Indoor horizons automatically match "
+    .. "the room's own border/void material so the finite map ring cannot reveal "
+    .. "a differently coloured infinite fill behind it.",
+    full = true, managerOnly = true },
   -- Marked `full` on the battle rows' reasoning, and then some. FULL SETS this
   -- to SYNC on arrival (applyFull) because the diorama's sky should follow the
   -- clock on the wall; it used to HOLD it there and take the row away, which
@@ -912,6 +1022,20 @@ local function pinEngineFx(game)
   if changed and game.writeOptions then pcall(game.writeOptions, game) end
 end
 
+-- The staged composition is authored against ADVANCED (RED++) and the original
+-- centered 160x144 furniture. Apply that presentation when a journey starts,
+-- then leave both engine rows live so the player can change either afterward.
+local function applyPresentationDefaults(game)
+  game = game or require("src.core.Game")
+  local opts = game and game.save and game.save.options
+  if not opts then return end
+  local changed = opts.colors ~= "redpp" or opts.uiLayout ~= "centered"
+  opts.colors = "redpp"
+  opts.uiLayout = "centered"
+  pcall(require("src.render.PaletteFX").setMode, "redpp")
+  if changed and game.writeOptions then pcall(game.writeOptions, game) end
+end
+
 -- call next() first and decorate what comes back, so every other mod's
 -- rows survive this one
 mod.hooks:wrap("ui.options.rows", function(next, game, rows)
@@ -959,7 +1083,8 @@ mod.hooks:wrap("ui.options.rows", function(next, game, rows)
     -- And a row whose own switch is off the table this frame (BACK SPRITES,
     -- which needs a staged fight to be about) is left off with it. The mod
     -- manager's page carries every one of them either way.
-    local offered = (entry.full or not full)
+    local offered = not entry.managerOnly
+                    and (entry.full or not full)
                     and (not entry.when or entry.when())
     if offered then extra[#extra + 1] = entry[1]:row() end
   end
@@ -1068,7 +1193,7 @@ end)
 -- and a player who stepped off FULL could not see the rows come back.
 --
 -- Rebuilt in place, and only on a step that changes the LIST: crossing FULL,
--- or toggling 3D-BTL, which is the other row that owns one (BATTLE LAYOUT).
+-- toggling 3D-BTL, or switching the player's selected sprite side.
 -- Every other rung returns the same list, and rebuilding on all of them would
 -- rerun every mod's ui.options.rows hook once per keypress. The cursor is
 -- clamped rather than reset, so it stays on the row it was just used on
@@ -1090,13 +1215,15 @@ do
       -- the VR row hides the two battle rows while it is on, so stepping
       -- it changes the LIST exactly the way 3D-BTL does
       local hadVR = VR.enabled()
+      local hadPlayerSide = BattleArt.playerSide()
       local wasOn = idAt(self, self.index)
       inner(self, dt)
       local after = Pipelines.level("voxel")
       local crossedFull = after ~= before
                           and (Voxel.isFull(before) or Voxel.isFull(after))
       if crossedFull or OverworldBattle.enabled() ~= hadBattles
-         or VR.enabled() ~= hadVR then
+         or VR.enabled() ~= hadVR
+         or BattleArt.playerSide() ~= hadPlayerSide then
         local rebuilt = OptionsMenu.new(self.game)
         self.rows = rebuilt.rows
         -- Follow the row the cursor was ON rather than the slot it was in:
@@ -1269,6 +1396,7 @@ mod.hooks:wrap("pokemon.sprite", function(next, path, ctx)
   if not (ctx and ctx.kind == "battle" and ctx.side == "back") then
     return out
   end
+  if BattleArt.playerSide() ~= "front" then return out end
   if not OverworldBattle.wantsFront() then return out end
   local def = ctx.data and ctx.data.pokemon and ctx.data.pokemon[ctx.species]
   return (def and def.spriteFront) or out
@@ -1326,11 +1454,13 @@ mod.events:on("save.loaded", function()
   -- pinEngineFx). Answered here rather than only when the menu opens, so a
   -- player who never opens it is not left playing under one.
   pinEngineFx()
+  applyPresentationDefaults()
 end)
 
 mod.events:on("save.created", function()
   DayNight.restore()
   pinEngineFx()
+  applyPresentationDefaults()
 end)
 
 -- The engine's own time-of-day seam. OverworldState:timeOfDay() is an
@@ -1344,7 +1474,15 @@ mod.hooks:wrap("world.tod", function(next, tod, ctx)
   return DayNight.tod()
 end)
 
-mod.exports.version = "1.5.5"
+mod.exports.version = "2.0.2"
+mod.exports.battleStage = BattleStage.export(OverworldBattle)
+mod.exports.battlePresentation = BattlePresentation.export()
+-- Species art ownership + metrics, so companion mods (Stadium 2 importer,
+-- effects mods) read the same battler identity Battle Art staged.
+mod.exports.battleArt = BattleArt
+-- Hook-aware screens (title, summary, dex entry) pick up BATTLE ART fronts
+-- outside battle; every hook pcalls its screen module and skips on mismatch.
+InterfaceSprites.install()
 -- exposed so a companion mod can pin its own tiles' shapes or read the
 -- camera without reaching into this mod's file layout
 mod.exports.lib = V

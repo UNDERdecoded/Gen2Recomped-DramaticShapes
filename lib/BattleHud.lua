@@ -372,6 +372,38 @@ end
 -- image the quads land on is a colour canvas, and a flip pass over it would
 -- whiten the terrain behind the glyphs along with them.
 local hudLayer = nil
+local brightBarLayer = nil
+local brightBarShader = nil
+
+-- HudTiles multiplies its colored fill by the DMG shade-2 source (170/255),
+-- so even the native Gen2 palettes arrive muddy in the detached texture.
+-- Normalize saturated pixels only inside the two HP fills and the EXP fill;
+-- their black outlines and every other HUD glyph remain untouched.
+local BRIGHT_BARS = [[
+  vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+    vec4 p = Texel(tex, tc);
+    bool enemyHP = tc.x >= 0.2000 && tc.x < 0.5000
+                   && tc.y >= 0.1111 && tc.y < 0.1667;
+    bool playerHP = tc.x >= 0.6000 && tc.x < 0.9000
+                    && tc.y >= 0.5000 && tc.y < 0.5556;
+    bool playerExp = tc.x >= 0.5000 && tc.x < 0.9000
+                     && tc.y >= 0.6111 && tc.y < 0.6667;
+    float hi = max(max(p.r, p.g), p.b);
+    float lo = min(min(p.r, p.g), p.b);
+    if ((enemyHP || playerHP || playerExp) && hi - lo > 0.08 && hi > 0.0) {
+      p.rgb *= p.a / hi;
+    }
+    return p * color;
+  }
+]]
+
+local function getBrightBarShader()
+  if brightBarShader == nil then
+    local ok, sh = pcall(love.graphics.newShader, BRIGHT_BARS)
+    brightBarShader = (ok and sh) or false
+  end
+  return brightBarShader or nil
+end
 
 function BattleHud.layerTexture(w, h, dark, fn)
   if not hudLayer or hudLayer:getWidth() ~= w or hudLayer:getHeight() ~= h then
@@ -389,7 +421,25 @@ function BattleHud.layerTexture(w, h, dark, fn)
     -- flipGlyphs renders fn into its own scratch layer and composites the
     -- whitened result into whatever is bound, which is this canvas
     if dark then BattleHud.flipGlyphs(w, h, fn) else fn() end
+    local sh = getBrightBarShader()
+    if sh then
+      if not brightBarLayer or brightBarLayer:getWidth() ~= w
+          or brightBarLayer:getHeight() ~= h then
+        brightBarLayer = canvasOf(w, h, "nearest")
+      end
+      if brightBarLayer then
+        g.setCanvas(brightBarLayer)
+        g.clear(0, 0, 0, 0)
+        g.setBlendMode("replace", "premultiplied")
+        g.setShader(sh)
+        g.setColor(1, 1, 1, 1)
+        g.draw(hudLayer, 0, 0)
+        g.setShader()
+        hudLayer, brightBarLayer = brightBarLayer, hudLayer
+      end
+    end
   end)
+  g.setShader()
   if prevCanvas then g.setCanvas(prevCanvas) else g.setCanvas() end
   g.setBlendMode(prevBlend or "alpha", prevAlpha)
   g.setColor(1, 1, 1, 1)
@@ -411,7 +461,7 @@ function BattleHud.invalidate()
   frostW, frostH = 0, 0
   luma = {}
   wasDark = false
-  layer, hudLayer = nil, nil
+  layer, hudLayer, brightBarLayer = nil, nil, nil
 end
 
 return BattleHud

@@ -39,7 +39,7 @@
 -- already rests on; the caller passes its answer in (applyRig/tint).
 --
 -- Persistence: the running cycle's clock is written into the mod's own
--- save-file bucket (save.modData.DRAMATIC_SHAPE, via mod.save) on the
+-- save-file bucket (save.modData.BATTLE_ART_VOXEL_GEN2, via mod.save) on the
 -- engine's save.writing event, and read back on save.loaded/created. A save
 -- with no clock in it starts at noon.
 

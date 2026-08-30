@@ -3,7 +3,7 @@
 return {
   summary = "The overworld as a 3D diorama, and battles fought on it: real occlusion, tilt-shift, over-the-shoulder fights.",
   author = "DramaticShape",
-  contact = "https://github.com/DramaticShape/DRAMATIC_SHAPE",
+  contact = "https://github.com/DramaticShape/BATTLE_ART_VOXEL_GEN2",
   tags = { "graphics", "3d", "voxel", "render-pipeline", "presentation",
            "battle" },
   differences = {

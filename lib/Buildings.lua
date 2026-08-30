@@ -39,7 +39,7 @@
 --
 -- One model is built per template and stamped at every placement: Red's
 -- and Blue's houses are the same seven-placement drawing, so they cost one
--- build between them. mods/DRAMATIC_SHAPE/tools/building_voxels.py is the
+-- build between them. mods/BATTLE_ART_VOXEL_GEN2/tools/building_voxels.py is the
 -- reference implementation of the same algorithm and prints the voxel and
 -- shell counts this one must agree with.
 --

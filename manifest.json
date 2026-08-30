@@ -6,11 +6,11 @@
   "entry": "main.lua",
   "profile": "content",
   "category": "GRAPHICS",
-  "game_version": "0.0.0-dev || >=0.1.37 <2.0.0",
+  "game_version": "0.0.0-dev || >=0.1.37 <3.0.0",
   "priority": 100,
   "dependencies": [],
   "optional_dependencies": [],
-  "conflicts": [],
+  "conflicts": ["Gen2Recomped-DramaticShapes"],
   "permissions": [
     "engine_internals"
   ],

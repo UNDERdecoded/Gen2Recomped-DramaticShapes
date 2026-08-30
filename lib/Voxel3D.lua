@@ -275,6 +275,32 @@ local SHADER = [[
 -- Each entry is nil = untried, false = unavailable.
 local shaders = { [false] = nil, [true] = nil }
 local activeShader = nil      -- the variant this pass bound
+local backdropShader = nil
+
+local BACKDROP_BLUR = [[
+  uniform vec2 texel;
+  uniform float radius;
+  vec4 effect(vec4 color, Image image, vec2 uv, vec2 screen) {
+    vec2 d = texel * radius;
+    vec4 sum = Texel(image, uv) * 4.0;
+    sum += (Texel(image, uv + vec2(d.x, 0.0))
+         + Texel(image, uv - vec2(d.x, 0.0))) * 2.0;
+    sum += (Texel(image, uv + vec2(0.0, d.y))
+         + Texel(image, uv - vec2(0.0, d.y))) * 2.0;
+    sum += Texel(image, uv + d) + Texel(image, uv - d);
+    sum += Texel(image, uv + vec2(d.x, -d.y));
+    sum += Texel(image, uv + vec2(-d.x, d.y));
+    return color * (sum / 16.0);
+  }
+]]
+
+local function getBackdropShader()
+  if backdropShader == nil then
+    local ok, sh = pcall(love.graphics.newShader, BACKDROP_BLUR)
+    backdropShader = (ok and sh) or false
+  end
+  return backdropShader or nil
+end
 
 -- Scene canvases, one per NAMED SLOT. There are exactly two callers and
 -- they want different sizes -- the free-roam pass renders at the window's
@@ -1030,6 +1056,36 @@ function Voxel3D.flatten(color, amount)
   else
     pcall(sh.send, sh, "ghost", 0)
   end
+end
+
+function Voxel3D.coverRect(iw, ih, cw, ch, topOffset)
+  if not (iw and ih and cw and ch and iw > 0 and ih > 0
+          and cw > 0 and ch > 0) then return nil end
+  local scale = math.max(cw / iw, ch / ih)
+  local available = math.max(0, ih - ch / scale)
+  local crop = math.max(0, math.min(available, tonumber(topOffset) or 0))
+  return (cw - iw * scale) / 2, -crop * scale, scale
+end
+
+function Voxel3D.backdrop(image, topOffset)
+  if not (active and image and image.getDimensions) then return false end
+  local ok, iw, ih = pcall(image.getDimensions, image)
+  if not ok then return false end
+  local x, y, scale = Voxel3D.coverRect(
+    iw, ih, canvasW, canvasH, topOffset)
+  if not scale then return false end
+  local sh = getBackdropShader()
+  love.graphics.setShader(sh)
+  if sh then
+    pcall(sh.send, sh, "texel", { 1 / iw, 1 / ih })
+    pcall(sh.send, sh, "radius", 0.70)
+  end
+  love.graphics.setDepthMode()
+  love.graphics.setColor(1, 1, 1, 1)
+  love.graphics.draw(image, x, y, 0, scale, scale)
+  love.graphics.setDepthMode("lequal", true)
+  love.graphics.setShader(activeShader)
+  return true
 end
 
 -- ------------------------------------------------------- the water pass --

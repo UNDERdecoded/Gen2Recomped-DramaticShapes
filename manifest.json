@@ -10,7 +10,7 @@
   "priority": 100,
   "dependencies": [],
   "optional_dependencies": [],
-  "conflicts": ["Gen2Recomped-DramaticShapes"],
+  "conflicts": [],
   "permissions": [
     "engine_internals"
   ],

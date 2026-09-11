@@ -17,10 +17,26 @@
 -- bumped whenever this mod changes the binary vertex meaning or core meshing
 -- rules. Texture/palette changes do not invalidate geometry because terrain
 -- meshes sample TerrainAtlas separately at draw time.
+--
+-- THAT LAST SENTENCE HAS A LIMIT, AND IT COST AN AFTERNOON. A stored vertex
+-- carries its UV, so what must not change is not the atlas's COLOURS but its
+-- LAYOUT. Recolour a sheet and every cached mesh is still right; move where
+-- tile 37 sits on it and every cached mesh now samples somewhere else. Gen 3
+-- did exactly that -- a pair used to bake as a grid of 16x16 metatile cells
+-- (256x656) and now bakes as an ordinary 8px tile sheet in synthetic-tile-id
+-- order (128x2336) -- so every mesh written before the change draws the right
+-- shape wearing a stranger's texture: rainbow banding outdoors, black
+-- indoors. And it kept doing it across restarts and across three rounds of
+-- fixes to the live code, because a cache is precisely the thing a rebuild
+-- does not fix.
+--
+-- So the Gen 3 sheet geometry is part of the signature now. A layout change
+-- is a cache MISS from here on and nobody has to remember to bump anything.
 
 local V = ...
 local Voxel3D = V.require("Voxel3D")
 local Budget = V.require("BuildBudget")
+local Gen3 = V.require("Gen3")
 
 local Cache = {
   hits = 0,
@@ -32,7 +48,10 @@ local Cache = {
   lastError = nil,
 }
 
-local GEOM_REV = "dsvx-160-r1"
+-- r2: the Gen 3 atlas was relaid from 16x16 metatile cells to 8px tiles, which
+-- changes the meaning of every stored UV. Bumped so the r1 directory is
+-- ignored outright rather than half-trusted; it can be deleted at leisure.
+local GEOM_REV = "dsvx-160-r3"
 local DIR = "dramatic_shape_voxel_cache/" .. GEOM_REV
 local FLOATS_PER_VERTEX = 6
 local BYTES_PER_VERTEX = FLOATS_PER_VERTEX * 4
@@ -129,7 +148,7 @@ local function bodySignature(map)
   if map and type(map.tileAt) == "function" then
     for y = 0, th - 1 do
       for x = 0, tw - 1 do
-        h = hashAdd(h, map:tileAt(x, y) or -1)
+        h = hashAdd(h, Gen3.tileAt(map, x, y) or -1)
         if Budget and type(Budget.tick) == "function" then Budget.tick() end
       end
     end
@@ -210,28 +229,63 @@ local function configSignature()
   return tostring(h)
 end
 
+-- The SHAPE RULES' own revision, read from lib/Structures.lua where it lives
+-- beside the rules it describes. GEOM_REV below covers the binary format;
+-- this covers what the geometry MEANS, and the difference cost several
+-- rounds of "the fix did not land" -- it had landed, and the cache was
+-- serving the world from before it.
+local function shapeSignature()
+  local ok, S = pcall(V.require, "Structures")
+  if ok and type(S) == "table" and S.SHAPE_REV then
+    return tostring(S.SHAPE_REV)
+  end
+  return "?"
+end
+
 local function rulesSignature(map)
   return table.concat({ pinsSignature(map), configSignature(),
-    Cache.rulesTag or "" }, ",")
+    Cache.rulesTag or "", shapeSignature() }, ",")
 end
 
 -- Which slots are worth persisting, and how each one is keyed.
 --
--- FULL is the mesh for the map the player stands on: it carries the border
--- ring, and the ring is cut where resident neighbours sit, so the neighbour
--- rectangles belong in its key.
+-- FULL is the mesh for a map drawn WITH its border ring: the ring is cut
+-- where the bodies around it sit, so those rectangles belong in its key.
+-- They used to be the maps loaded around the PLAYER, which made the key
+-- depend on where the player was standing; since VoxelScene.masksFor they
+-- are the map's own two-hop neighbourhood, so the key -- like the body's --
+-- now depends on nothing but the map and the rules, and one entry answers
+-- for the map whether it is under the player's feet or drawn beside them.
 --
--- BODY is a neighbour's contribution -- no ring, no masks, and therefore a
--- key that depends on nothing but the map and the rules. That stability is
--- what makes it worth prebaking: every map's body mesh can be written once,
--- ahead of time, and it is still valid when you walk in from a direction
--- nobody predicted. It is also the slot that was missing when a town stayed
--- flat until you had stood in it long enough to mesh it.
+-- BODY is a map with no ring at all -- no masks, and therefore a key that
+-- depends on nothing but the map and the rules. That stability is what makes
+-- it worth prebaking: every map's body mesh can be written once, ahead of
+-- time, and it is still valid when you walk in from a direction nobody
+-- predicted. It is also the slot that was missing when a town stayed flat
+-- until you had stood in it long enough to mesh it.
 local CACHEABLE = { full = true, body = true }
+
+-- THE ATLAS LAYOUT, for maps whose UVs depend on one this module cannot see.
+-- Gen 1 and Gen 2 read their sheet off disk, and its layout is a property of
+-- that file -- already covered, through the tileset id, by bodySignature. A
+-- Gen 3 pair has no file: this mod bakes the sheet, and how it lays it out is
+-- a decision that can change between versions while every other input stays
+-- byte-identical. That is not a texture change, it is a change in what a
+-- stored UV MEANS, and it belongs in the key.
+local function atlasSignature(map)
+  local tileset = map and map.tileset
+  local ok3, G = pcall(V.require, "Gen3")
+  if not (ok3 and G and tileset and G.isGen3(tileset)) then return "-" end
+  local ok, info = pcall(G.describe, tileset)
+  if not (ok and info) then return "g3?" end
+  return table.concat({ "g3", tostring(info.perRow), tostring(info.width),
+                        tostring(info.height) }, ":")
+end
 
 local function signature(map, slot, masks)
   return table.concat({ GEOM_REV, bodySignature(map), tostring(slot),
-    slot == "body" and "-" or maskSignature(masks), rulesSignature(map) }, "|")
+    slot == "body" and "-" or maskSignature(masks), rulesSignature(map),
+    atlasSignature(map) }, "|")
 end
 
 local function paths(map, slot)

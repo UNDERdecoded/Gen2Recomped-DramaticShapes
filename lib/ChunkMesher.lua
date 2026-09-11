@@ -55,6 +55,7 @@ local Structures = V.require("Structures")
 local TileShape = V.require("TileShape")
 local Voxel3D = V.require("Voxel3D")
 local Budget = V.require("BuildBudget")
+local Gen3 = V.require("Gen3")
 
 -- Persistent geometry cache. Optional on purpose: a build without the module
 -- (or one whose option is off) simply meshes every time, exactly as before.
@@ -297,12 +298,15 @@ end
 -- -------------------------------------------------------------- geometry
 
 -- Emit the raw geometry for `map` into `sink`. `bodyOnly` skips the
--- border ring -- the shape the 2D path's drawMapOnly has always had: a
--- neighbour map contributes its body, and only the CURRENT map supplies
--- the ring around the view.
+-- border ring -- the shape the 2D path's drawMapOnly has always had, where
+-- only the CURRENT map supplies the ring around the view. In three
+-- dimensions EVERY map drawn in the frame carries its own (see
+-- VoxelScene.masksFor): a neighbour with no ring stops dead at its body
+-- edge with the sky behind it, which on a flat screen is off the side of
+-- the picture and in a diorama is the middle of it.
 --
 -- `masks` (full variant only) lists rectangles, in this map's world
--- pixels, where connected neighbour BODIES sit: ring geometry inside them
+-- pixels, where the BODIES around it sit: ring geometry inside them
 -- is suppressed. The 2D renderer never needed this because it painted
 -- neighbour bodies OVER the ring; with a depth buffer the ring's standing
 -- trees would rise straight through the neighbour's flat ground -- cross
@@ -328,6 +332,36 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
   local perRow = tileset.tilesPerRow or 16
   local atlasW = tileset.imageWidth or (perRow * 8)
   local atlasH = tileset.imageHeight or 48
+
+  -- THE GEN 3 SHEET.  Not a grid of 8x8 tiles but a grid of 16x16 METATILES,
+  -- and none of the three numbers above exists on a pair record -- so the
+  -- fallbacks answered 16 / 128 / 48 for a sheet that is really 256 wide and
+  -- as many as 656 rows tall.  Every UV in the world came out of the top-left
+  -- corner of it.
+  -- GEN 3 NEEDS NO UV ARM ANY MORE.  The atlas is emitted as an ordinary 8px
+  -- tile sheet in synthetic-tile-id order (lib/Gen3.lua), so every UV below
+  -- is the same arithmetic Kanto uses -- once the three lines above read the
+  -- truth instead of the Gen 1 fallbacks.
+  --
+  -- `Gen3.describe` AND NOT `Gen3.forMap`, and the difference is the whole of
+  -- the rainbow-striped world.  The sheet's geometry is a property of the
+  -- PAIR: it needs no map, no context and no bake, and describe answers it
+  -- from the tileset record alone.  Reaching for the context instead made the
+  -- UVs depend on a thing that can legitimately not exist yet -- a map's mesh
+  -- is queued before its world record is published, and `forMap` caches that
+  -- miss -- and the failure was not a missing texture but `imageHeight or
+  -- 48`: an 8px quad stretched over 48 rows of a 2336-row sheet, which is
+  -- forty-eight unrelated tile rows crushed into one face.  That is the
+  -- rainbow banding, and indoors, where those rows are unpainted, the same
+  -- arithmetic renders the room black.
+  --
+  -- Nothing here may fall back to a Gen 1 constant on a Gen 3 pair.  There is
+  -- no sane default: 128x48 is not a smaller version of 128x2336, it is a
+  -- different sheet.
+  if Gen3.isGen3(tileset) then
+    local info = Gen3.describe(tileset)
+    perRow, atlasW, atlasH = info.perRow, info.width, info.height
+  end
 
   -- ------------------------------------------------------------- ledge lips
   --
@@ -363,8 +397,28 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
   end
 
   -- s.h for the tile the rim is drawn on, 0 for the rest of its cell
+  --
+  -- ...AND ON A GEN 3 MAP, s.h FOR THE WHOLE CELL.
+  --
+  -- The split above is a Gen 1/2 reading and it carries two assumptions the
+  -- Hoenn arm breaks.  `ledgeDrop` names the side the lip faces from the
+  -- ROM's own tile classes $A0-$AF, which no Gen 3 tileset uses -- every
+  -- Emerald ledge therefore fell through to the default "down" and the split
+  -- ran across the wrong axis on the three hop-east ledge lines of Route
+  -- 112's hillside.  And the half that is not the rim is given the WORLD
+  -- DATUM, which was the turf's height when every map was flat; on a terraced
+  -- route it is a hole punched from the terrace down to zero.
+  --
+  -- Both faults read the same way at eye level: "the ledges still have half
+  -- raised on the lip and half not raised, and one of them seems lowered".
+  --
+  -- Under `standGen3Ledges` a Gen 3 ledge cell is no longer a kerb standing
+  -- in a field -- it IS the rim of the terrace it edges, founded on the
+  -- landing and standing the lip's own six pixels to meet the ground behind
+  -- it.  The whole cell is that rim, so the whole cell is s.h.
   local function shapeHeight(tx, ty, s)
     if s.class ~= "ledge" then return s.h end
+    if S.isGen3 then return s.h end
     local d = ledgeDrop(math.floor(tx / 2), math.floor(ty / 2))
     local onDrop
     if d == "up" then onDrop = ty % 2 == 0
@@ -374,19 +428,116 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
     return onDrop and s.h or 0
   end
 
+  -- A VACATED CELL STILL HAS A FLOOR UNDER IT.
+  --
+  -- `skip` means "the drawing on this cell stood up into a hull; do not build
+  -- a terrain column here" -- and the pass that sets it also records a
+  -- replacement ground tile in `S.ground`, so a floor IS drawn.  Returning 0
+  -- for its height drew that floor at the world datum: a square pit at every
+  -- signpost, tree and barrel that stands on a terrace.
+  --
+  -- `Structures.stampGround` was written for exactly this question -- "the
+  -- answer is the datum the stamp stands on, which is where the ground the
+  -- walker is actually on was painted" -- and nothing in the mesher was
+  -- asking it.  Measured: 23 of Route 111's 100 drawn pits are `skip` cells
+  -- under a cylinder or a signpost, and on a flat Gen 1 or Gen 2 map the
+  -- answer is 0, which is what it already was.
+  local stampH = {}
   local function heightAt(tx, ty)
     local k = keyOf(tx, ty)
-    if S.skip[k] then return 0 end
+    if S.skip[k] then
+      local hit = stampH[k]
+      if hit == nil then
+        local okS, z = pcall(Structures.stampGround, map, tx, ty)
+        hit = (okS and tonumber(z)) or 0
+        stampH[k] = hit
+      end
+      return hit
+    end
     local run = S.runs[k]
     if run then return run.h end
     local s = S.shapeAt[k]
     return s and shapeHeight(tx, ty, s) or 0
   end
 
+  -- WHAT A NEIGHBOUR OCCLUDES IS NOT ALWAYS HOW TALL IT IS.
+  --
+  -- A face is cut wherever the neighbour is at least as tall, which is right
+  -- for a column and wrong for everything drawn as a HULL.  A rock column, a
+  -- tree crown, a fence post, a barrel: `buildCylinders` and its siblings
+  -- carve those per pixel and they are round, so the ground beside them, told
+  -- that the neighbour reaches 48, draws no wall -- and you see past the hull
+  -- on both sides of it, straight out of the map.
+  --
+  -- That is the largest remaining hole in the region and it has been there
+  -- from the start.  Route 114's mountain, painted flat magenta so a hole
+  -- could be told from a pond (they are the same pixel under a real sky --
+  -- Emerald renders water as the sky's own colour), reads 15,800 pixels of
+  -- daylight through it, almost all of it beside the pale rock columns of its
+  -- north-east flank.
+  --
+  -- What a hull occludes is its FOOT, because that is the only part of it
+  -- that fills its cell.  A stamped cell already answers that way -- its
+  -- height IS the ground the stamp stands on -- so this is the same rule
+  -- reaching the hulls that were never stamped.
+  --
+  -- Gen 3 only.  Kanto and Johto draw the same classes, and their ground is
+  -- flat, so the wall this uncovers would be zero pixels tall on almost every
+  -- tile and a change in vertex count for nothing.
+  local HULL_CLASS = {
+    cylinder = true, canopy = true, stump = true, can = true,
+    planter = true, billboard = true, post = true,
+  }
+  -- ...AND A SEAM IS NOT GROUND AT ALL.
+  --
+  -- The ring tile just outside a CONNECTED edge is never drawn: this map's
+  -- ring is masked out under the neighbour's body (see `masked` below) and
+  -- the neighbour's own terrain is what stands there, at the neighbour's own
+  -- height.  `standGen3Apron` had nonetheless stood that tile up to OUR edge,
+  -- so the question "is my neighbour lower than me?" came back "no" on both
+  -- sides of every seam in Hoenn and neither map walled the step -- 5,184
+  -- pixels of open sky along Route 113's border with Route 112 alone, worst
+  -- band 176px.  `Structures.openGen3Seams` marks that one tile line; a face
+  -- cut against it runs down to the datum and closes whatever the neighbour
+  -- turns out to be.  It is the FACE question only, which is why it lives
+  -- here and not in `heightAt`: the ambient-occlusion corners and the roof
+  -- hips read a seam as ordinary ground, exactly as before.
+  --
+  -- ONE COURSE BELOW THE DATUM, not at it.  Hoenn draws the sea two pixels
+  -- into its own cell, so a sea route meeting a sea route across a seam is a
+  -- 2px step below zero -- 64 tiles of it on Route 127's border with
+  -- Mossdeep -- and a face cut at zero cannot reach it.  Everything a course
+  -- under the datum is enclosed by the two maps' own ground and is never
+  -- visible from a camera above the world.
+  local SEAM_DATUM = -16
+  local function occludeH(tx, ty)
+    if not S.isGen3 then return heightAt(tx, ty) end
+    local k = keyOf(tx, ty)
+    if S.seamOpen and S.seamOpen[k] then return SEAM_DATUM end
+    if S.skip[k] or S.runs[k] then return heightAt(tx, ty) end
+    local s = S.shapeAt[k]
+    if s and HULL_CLASS[s.class] then
+      local b = s.base or 0
+      local h = shapeHeight(tx, ty, s)
+      return (b < h) and b or h
+    end
+    return heightAt(tx, ty)
+  end
+
+  -- Where a tile's 8x8 art sits on the atlas.  Gen 1 and Gen 2 lay the atlas
+  -- out as tiles and the id IS the position; Gen 3 lays it out as 16x16
+  -- metatiles and the id is `metatile * 4 + quadrant`, so the origin is the
+  -- metatile's corner plus the quadrant's offset inside it.  One function,
+  -- because every terrain quad in the world -- tops, sides, sub-tile boxes --
+  -- comes through here, and a factor of two wrong in one of them is a world
+  -- textured from the wrong quarter of every drawing.
+  local function tileOrigin(tile)
+    return (tile % perRow) * 8, math.floor(tile / perRow) * 8
+  end
+
   -- one atlas-rect UV, optionally cropped to art rows [vTop, vBot] of 8
   local function uvRect(tile, vTop, vBot)
-    local ax = (tile % perRow) * 8
-    local ay = math.floor(tile / perRow) * 8
+    local ax, ay = tileOrigin(tile)
     local vi = math.min(INSET, (vBot - vTop) / 4)
     return (ax + INSET) / atlasW, (ax + 8 - INSET) / atlasW,
            (ay + vTop + vi) / atlasH, (ay + vBot - vi) / atlasH
@@ -505,8 +656,11 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
 
   -- `to` routes the quad somewhere other than the main sink -- the water
   -- surface is the only caller that ever does (see runGeometry's header).
-  local function topQuad(x0, z0, h, tile, shade, to)
-    local u0, u1, v0, v1 = uvRect(tile, 0, 8)
+  -- `vTop`/`vBot` crop the art rows the top face wears, for a volume whose
+  -- drawn roof band is shallower than its footprint (see the Gen 3 stretch
+  -- at the flat-top branch below). Whole tile when they are omitted.
+  local function topQuad(x0, z0, h, tile, shade, to, vTop, vBot)
+    local u0, u1, v0, v1 = uvRect(tile, vTop or 0, vBot or 8)
     ;(to or push)({ { x0, h, z0 }, { x0 + 8, h, z0 },
                     { x0 + 8, h, z0 + 8 }, { x0, h, z0 + 8 } },
                   { { u0, v0 }, { u1, v0 }, { u1, v1 }, { u0, v1 } },
@@ -535,7 +689,10 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
   end
 
   local def = map.def
-  local tw, th = def.width * 4, def.height * 4         -- map size in tiles
+  -- map size in tiles.  A Gen 1/Gen 2 block is 4 tiles on a side; a Gen 3
+  -- metatile is 2, and IS one cell.
+  local blockTiles = tonumber(tileset.blockTiles) or 4
+  local tw, th = def.width * blockTiles, def.height * blockTiles
   local r = bodyOnly and 0 or RING * 4
 
   -- true when the (ring) position lies under a connected neighbour's body
@@ -582,8 +739,26 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
       -- that the 2x2 grouping could not take -- a canopy whose partners
       -- fall outside the shortened ring is left unclaimed, and one strip of
       -- boxes along an edge is the whole artefact this avoids.
+      -- ...BUT A HIDDEN BOX IS NOT A HIDDEN FLOOR.
+      --
+      -- Nulling the shape took the ground away with the box, and under a
+      -- carved forest that is a hollow moat between the map's edge and the
+      -- trunks -- invisible while every map was flat and the largest hole in
+      -- the frame once the body stands on terraces.  The rule is about not
+      -- standing a flat-topped BOX beside a carved trunk; it is answered by
+      -- flattening the cell, not by deleting it.  `standGen3Apron` marks the
+      -- floors it lays itself, and those are already flat.
+      -- ...OUTDOORS.  Indoors `standGen3Apron` lays no floor and this
+      -- flattening would keep a box the rule exists to remove.
       if not inBody and S.hideBareRing and not S.skip[k] then
-        s = nil
+        if s == nil or s.apron or not S.outdoor then
+          -- keep it (or, indoors, drop it as before)
+          if not S.outdoor and s and not s.apron then s = nil end
+        else
+          s = { class = "ground", art = "flat", flat = true,
+                h = s.h or 0, base = s.base or 0, gen3 = s.gen3,
+                apron = true }
+        end
       end
 
       if s and S.skip[k] then
@@ -595,7 +770,31 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
           -- claim carries the height its ground vote found (Buildings.stamp),
           -- so a house on a terrace paints its floor on the terrace instead
           -- of on the world datum sixteen pixels below it.
-          local gy = s.base or 0
+          --
+          -- ...AND AT THE HEIGHT THIS CELL TELLS EVERYONE ELSE IT IS.
+          --
+          -- `s.base` was only half the answer.  `Structures.stampGround` --
+          -- which is what `heightAt` gives this cell, and therefore what the
+          -- neighbours cut their faces against -- takes `s.base` when the
+          -- stamp recorded one and asks `standHeight` when it did not.  On
+          -- Hoenn most stamps did not: a tree crown, a rock column, a
+          -- signpost carry no base, so the floor was painted at the WORLD
+          -- DATUM while every neighbour was told the cell stood on the
+          -- terrace.  Neither side drew a wall between them and the result is
+          -- an open shaft from the terrace to zero, on
+          --
+          --     Route119 723 tiles   Route111 444   Route112 286
+          --     JaggedPass 176 (worst 120px)  Route114 165
+          --
+          -- which is most of the daylight through Route 114's mountain: with
+          -- a flat magenta sky, 15,800 pixels of it.  Painted where the cell
+          -- says it stands, the shaft closes.
+          --
+          -- Gen 1 and Gen 2 are unmoved by construction: their ground is the
+          -- datum, so `standHeight` answers 0 and this is the number it was
+          -- already using.
+          local gy = heightAt(tx, ty)
+          if type(gy) ~= "number" then gy = s.base or 0 end
           topQuad(tx * 8, ty * 8, gy, g, 1)
           -- the claimed tile is still ground at height 0, and water next
           -- door still recesses below it: without the same below-ground
@@ -605,7 +804,7 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
           -- waterline showed. Same bands, cut from the synthesized
           -- ground's own art
           for _, side in ipairs(SIDES) do
-            local nh = heightAt(tx + side[1], ty + side[2])
+            local nh = occludeH(tx + side[1], ty + side[2])
             if nh < gy then
               local d = side[3]
               local lat = LATERAL[d]
@@ -655,17 +854,31 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
         local x0, z0 = tx * 8, ty * 8
         local tile = S.tileAt[k]
 
+        -- A SCULPT RIDES WITH THE CELL IT WAS CUT INTO.
+        --
+        -- Sub-heights are absolute world heights, and the pass that cuts them
+        -- (Structures' kerb sculptor) runs long before the passes that settle
+        -- a cell's own height.  `sub.z0` is what `h` was when the relief was
+        -- cut; the difference between that and what `h` is now is how far the
+        -- whole cell has moved since, and the relief moves with it.  Without
+        -- this a fence tile lifted onto a terrace keeps a sculpt cut for the
+        -- ground three courses below and reads as a shaft through the mass.
+        local shift = 0
+        do
+          local z0 = s.sub.z0
+          if type(z0) == "number" then shift = base - z0 end
+        end
         local function subH(i, j)
           if i < 0 or j < 0 or i >= res or j >= res then return nil end
-          local v = hs[j * res + i + 1]
-          return tonumber(v) or base
+          local v = tonumber(hs[j * res + i + 1])
+          if v == nil then return base end
+          return v + shift
         end
 
         -- The art under one sub-square, so a sculpted tile keeps its drawing
         -- instead of repeating the whole tile per box.
         local function subUV(i, j)
-          local ax = (tile % perRow) * 8
-          local ay = math.floor(tile / perRow) * 8
+          local ax, ay = tileOrigin(tile)
           local u0 = (ax + i * step) / atlasW
           local u1 = (ax + (i + 1) * step) / atlasW
           local v0 = (ay + j * step) / atlasH
@@ -691,7 +904,7 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
               local ni, nj = i + side[1], j + side[2]
               local nh = subH(ni, nj)
               if nh == nil then
-                nh = heightAt(tx + side[1], ty + side[2])
+                nh = occludeH(tx + side[1], ty + side[2])
               end
               if nh < hh then
                 local d = side[3]
@@ -730,39 +943,402 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
         -- degree corners. Flat-topped volumes wear their top rows;
         -- everything else its own art.
         if run and run.rise > 0 then
-          local mid = run.extent / 2
+          -- The region's shared gable profile when it published one (see
+          -- Structures' end-of-region pass): a building's columns do not
+          -- share an extent, and a per-column ridge steps between them.
+          local gext = run.gableExtent or run.extent
+          local mid = gext / 2
+          -- A VAULT RISES AND STAYS UP; a pitch rises and comes back down.
+          -- `shedRoof` marks a civic roof whose drawn band is most of the
+          -- building (see Structures): its front curves up from the south
+          -- eave over that band and the rest of the footprint is its flat
+          -- back. Tapering it to a mid ridge instead is what turned the
+          -- Pokemon Center into a lozenge.
+          local shed = run.shedRoof
+          -- A VAULT RISES OVER THE WHOLE FOOTPRINT, not over as many rows as
+          -- it has art.  `shedRoof` counts the DRAWN roof courses; using it
+          -- as the depth of the rise left every row past it dead flat, and
+          -- the flat back then had no drawing of its own -- `artPix` handed
+          -- it a half-pixel slice of the ridge outline stretched over the
+          -- whole tile.  That is the charcoal slab across the top of every
+          -- Pokemon Center.  A Center's roof does rise all the way to its
+          -- back edge, so the rise spans the footprint and the drawn band
+          -- stretches over it (which `artPix` already does).
+          local shedDepth = shed
           local function gableH(d)     -- d = rows north of the south eave
-            local t = d <= mid and d / mid or (run.extent - d) / (run.extent - mid)
+            local t
+            if shed then
+              t = d / shedDepth
+            else
+              t = d <= mid and d / mid or (gext - d) / (gext - mid)
+            end
             return run.h + run.rise * math.max(0, math.min(1, t))
           end
           local d0 = run.front - ty                -- rows from the south edge
           local hS = gableH(d0)
           local hN = gableH(d0 + 1)
           -- art by proximity to the ridge, mirrored over the back
-          local rel = 1 - math.abs(d0 + 0.5 - mid) / math.max(mid, 0.5)
-          local idx = math.min(run.roofRows - 1,
-                               math.floor((1 - rel) * run.roofRows))
-          local roofTile = map:tileAt(tx, run.north + idx)
+          --
+          -- STRETCHED, NOT TILED, on Gen 3.  Picking a whole art ROW per
+          -- 8px strip is right only when the slope is exactly `roofRows`
+          -- strips deep.  Hoenn's buildings are drawn with a shallow roof
+          -- band over a deep footprint -- Oldale's Mart states two roof
+          -- rows across three cells of slope -- so the same row was chosen
+          -- for strip after strip and its art came out repeated: the Poke
+          -- Ball emblem stamped three times up the Mart's roof, which is
+          -- the "duplicating pokeball cymbal" report exactly.
+          --
+          -- So map the roof band CONTINUOUSLY: the strip's near and far
+          -- edges give a span in art pixels from the ridge (0) to the eave
+          -- (roofRows * 8), and the strip wears that slice of the drawing
+          -- -- cropped inside one row by uvRect, which already takes
+          -- fractional bounds.  Where the slope is roofRows strips deep
+          -- the slices land exactly on row boundaries and this is the old
+          -- behaviour; where it is deeper the art simply stretches, which
+          -- is what a roof drawn shallow and built deep must do.
+          local roofTile, rv0, rv1
+          if S.isGen3 and (run.roofRows or 0) > 0 then
+            local span = math.max(mid, 0.5)
+            -- the drawn band, which may reach a cell further north than the
+            -- volume does -- see `roofArtAbove` in Structures
+            local artRows = run.roofArtRows or run.roofRows
+            local artTop = run.roofArtTop or run.north
+            local band = artRows * 8
+            -- HOW DEEP THE DRAWING LIES, which is not how deep the roof
+            -- rises.  A shed rises over `shed` rows and is flat behind that,
+            -- but the drawing on it can be the whole footprint: the Mart
+            -- draws two roof rows over six of depth (so two rows wear it and
+            -- the flat back repeats the ridge course, and its Poke Ball
+            -- stays round), while the Pokemon Center draws all six.  Laying
+            -- either over the rise alone squashed the one that is drawn deep;
+            -- laying either over the footprint stretched the one that is not.
+            -- THE DRAWN ROOF COVERS THE WHOLE FOOTPRINT when the whole
+            -- drawing is inside the run: a building four cells deep has four
+            -- cells of roof, and the three cells of drawing that depict it
+            -- stretch to cover them.  A roof whose depth is still a guess --
+            -- two rows of pitch inferred on a house -- is laid at its drawn
+            -- size with a flat back behind it instead.
+            -- THE DRAWN ROOF COVERS THE WHOLE FOOTPRINT when the whole
+            -- drawing is inside the run: a building four cells deep has four
+            -- cells of roof, and the three cells of drawing that depict it
+            -- stretch to cover them.  Laid at its drawn size instead, the
+            -- rows past it repeat the ridge course and the roof came out
+            -- smeared from the emblem back.  A roof whose depth is still a
+            -- guess -- two rows of pitch inferred on a house with no folded
+            -- course -- keeps the drawn size and the flat back.
+            local artDepth = math.max(1, math.min(gext, artRows))
+            -- ...AND A ROOFTOP EMERALD DREW ONCE LIES BACK OVER ALL OF IT.
+            --
+            -- Rustboro's Gym, (11,15), 10 cells by 9.  Emerald draws its
+            -- rooftop as ONE cell of cream panel over eight cells of window
+            -- wall, so `artRows` is 2 and `gext` is 16 -- and with the band
+            -- laid over its own depth every strip past the second falls into
+            -- the flat-back branch below and wears the SAME four pixels of
+            -- row `artTop`.  Seventeen identical ribs down each wing, which
+            -- is what the frame shows.
+            --
+            -- The comment above already states the rule -- "a building four
+            -- cells deep has four cells of roof, and the drawing that depicts
+            -- it stretches to cover them" -- and the `min` is the opposite of
+            -- it.  It is right for a roof this pass GUESSED (two rows of
+            -- pitch inferred on a house with no stated roof: stretching a
+            -- guess over six cells smears it).  Where Emerald STATED the roof
+            -- on its above-player layer, the drawing is the whole rooftop and
+            -- it lies back across the whole footprint.
+            --
+            -- MEASURED with `tools/roofcover.lua`, the worst run of tile
+            -- strips on one column sharing one slice of art:
+            --   RustboroCity 16 -> 2   SlateportCity 6 -> 2
+            --   LilycoveCity  6 -> 2   SootopolisCity 6 -> 3
+            if S.isGen3 and run.gen3RoofRows then artDepth = math.max(1, gext) end
+            local function artPix(d)
+              -- a shed reads straight from eave to ridge; a pitch mirrors
+              local t
+              if shed then
+                t = 1 - d / artDepth
+              else
+                t = math.abs(d - mid) / span
+              end
+              return math.max(0, math.min(1, t)) * band
+            end
+            local a, b = artPix(d0), artPix(d0 + 1)
+            local p0, p1 = math.min(a, b), math.max(a, b)
+            if p1 - p0 < 0.5 then
+              -- PAST THE RIDGE.  A shed rises over its drawn band and the
+              -- rest of the footprint is its flat back, which the drawing
+              -- never shows -- so `artPix` clamps both edges to 0 and the
+              -- strip asked for a half-pixel sliver of the ridge course,
+              -- stretched over a whole tile of depth.  On the Mart that
+              -- sliver happened to be one row of a vertical stripe and read
+              -- correctly; on the Pokemon Center it is the dark outline over
+              -- the arch, and it smeared a charcoal slab across the roof --
+              -- the Centers "rendering weird".  The back wears the ridge
+              -- course whole instead, which is the same answer on the Mart
+              -- and a roof-coloured one on the Center.
+              -- ...and it wears the ridge course's LOWER half, not the whole
+              -- of it.  The top of that course is the roof's outer edge --
+              -- the Center's crest, a house's ridge band -- and repeating a
+              -- shaped edge four rows deep fans it out across the back of
+              -- the roof.  The half below it is the plain field the rest of
+              -- the roof is made of, which is what a flat back looks like.
+              if p0 <= 0.001 then p0, p1 = 4, 8 else p1 = p0 + 0.5 end
+            end
+            local ai = math.floor(((p0 + p1) / 2) / 8)
+            if ai < 0 then ai = 0 end
+            if ai > artRows - 1 then ai = artRows - 1 end
+            roofTile = S.tileAt[keyOf(tx, artTop + ai)]
+                       or Gen3.tileAt(map, tx, artTop + ai)
+            rv0 = math.max(0, math.min(7.5, p0 - ai * 8))
+            rv1 = math.max(rv0 + 0.5, math.min(8, p1 - ai * 8))
+          else
+            local rel = 1 - math.abs(d0 + 0.5 - mid) / math.max(mid, 0.5)
+            local idx = math.min(run.roofRows - 1,
+                                 math.floor((1 - rel) * run.roofRows))
+            roofTile = S.tileAt[keyOf(tx, run.north + idx)]
+                       or Gen3.tileAt(map, tx, run.north + idx)
+            rv0, rv1 = 0, 8
+          end
           local swY, seY, neY, nwY = hS, hS, hN, hN
-          if heightAt(tx - 1, ty) < run.h then     -- west flank: hip
+          local hipW = heightAt(tx - 1, ty) < run.h
+          local hipE = heightAt(tx + 1, ty) < run.h
+          if hipW then                             -- west flank: hip
             swY = math.max(run.h, hS - 8)
             nwY = math.max(run.h, hN - 8)
           end
-          if heightAt(tx + 1, ty) < run.h then     -- east flank: hip
+          if hipE then                             -- east flank: hip
             seY = math.max(run.h, hS - 8)
             neY = math.max(run.h, hN - 8)
           end
-          local u0, u1, v0, v1 = uvRect(roofTile, 0, 8)
+          local u0, u1, v0, v1 = uvRect(roofTile, rv0, rv1)
           push({ { x0, swY, z0 + 8 }, { x0 + 8, seY, z0 + 8 },
                  { x0 + 8, neY, z0 }, { x0, nwY, z0 } },
                { { u0, v1 }, { u1, v1 }, { u1, v0 }, { u0, v0 } }, 0.95)
+
+          -- CLOSE THE SIDE OF THE ROOF.
+          --
+          -- Everything below `run.h` is walled by the ordinary side-face
+          -- pass; everything above it was walled by nothing at all. Two
+          -- separate gaps followed, and both show as black wedges in the
+          -- roof:
+          --
+          --   * a HIPPED end, where the blocks above drop this column's
+          --     outer corners by a course to round the drawn corner --
+          --     the wedge between the facade top and the dropped edge;
+          --   * a STEP between neighbouring columns of one building. A
+          --     building's columns do not share a front row (Oldale's Mart
+          --     reads 12, 13, 13, 13) so their gables sit a row apart, and
+          --     the roof surfaces meet at different heights with no riser
+          --     between them. That is the pair of wedges either side of
+          --     that roof, and the slivers around the Gym's porch.
+          --
+          -- One rule covers both: the flank is closed from whatever the
+          -- neighbour's roof reaches up to this column's own edge. An
+          -- absent or lower neighbour bottoms out at `run.h`, where the
+          -- wall face below already stops, so the two meet exactly.
+          -- THE NEIGHBOUR'S ROOF, READ WITH THE NEIGHBOUR'S OWN PROFILE.
+          --
+          -- These two closures exist to close the step between one column's
+          -- roof and the next, and they were computing the neighbour's edge
+          -- with the PITCHED formula whatever profile it actually has.  On a
+          -- vault the two disagree most at the eave and not at all at the
+          -- ridge, so the riser was drawn short by exactly a wedge -- the
+          -- pair of black triangles under the eaves of every Pokemon Center
+          -- and Mart in Hoenn.  One profile function, used by the column
+          -- itself and by everyone reading it.
+          local function profileH(nr, d)
+            local ne = nr.gableExtent or nr.extent
+            local ndepth = nr.shedRoof
+            local t
+            if ndepth then
+              t = d / ndepth
+            else
+              local nm = ne / 2
+              t = d <= nm and d / nm or (ne - d) / (ne - nm)
+            end
+            return nr.h + (nr.rise or 0) * math.max(0, math.min(1, t))
+          end
+          local function roofEdge(ntx)
+            local nr = S.runs[keyOf(ntx, ty)]
+            if not nr then return nil end
+            if (nr.rise or 0) <= 0 then return nr.h, nr.h end
+            local nd = nr.front - ty
+            return profileH(nr, nd), profileH(nr, nd + 1)
+          end
+          local function flank(nsY, nnY, sY, nY, east)
+            local bS = math.max(run.h, math.min(nsY or run.h, sY))
+            local bN = math.max(run.h, math.min(nnY or run.h, nY))
+            if sY - bS < 0.5 and nY - bN < 0.5 then return end
+            local fx = east and (x0 + 8) or x0
+            if east then
+              push({ { fx, bS, z0 + 8 }, { fx, bN, z0 },
+                     { fx, nY, z0 }, { fx, sY, z0 + 8 } },
+                   { { u0, v1 }, { u1, v1 }, { u1, v0 }, { u0, v0 } },
+                   Voxel3D.FACE_SHADE[1])
+            else
+              push({ { fx, bN, z0 }, { fx, bS, z0 + 8 },
+                     { fx, sY, z0 + 8 }, { fx, nY, z0 } },
+                   { { u0, v1 }, { u1, v1 }, { u1, v0 }, { u0, v0 } },
+                   Voxel3D.FACE_SHADE[2])
+            end
+          end
+          if hipW then
+            flank(nil, nil, swY, nwY, false)
+          else
+            local ns, nn = roofEdge(tx - 1)
+            flank(ns, nn, swY, nwY, false)
+          end
+          if hipE then
+            flank(nil, nil, seY, neY, true)
+          else
+            local ns, nn = roofEdge(tx + 1)
+            flank(ns, nn, seY, neY, true)
+          end
+
+          -- ...and the same across the ROW boundaries. Within one run the
+          -- gable is continuous north to south by construction (a row's
+          -- south edge is the next row's north edge), so this only ever
+          -- fires where two different runs meet front to back: a porch, an
+          -- entrance bay, a wing set back from the main block. Rustboro's
+          -- Gym is the case that shows it -- its doorway juts one cell
+          -- south under a lower roof, and the step down to it had no riser.
+          -- ...AND WITH THE NEIGHBOUR'S HIP.  A hipped row drops its OUTER
+          -- corners by a course to round the drawn corner, and the row
+          -- behind it -- not hipped, because the column beside it does carry
+          -- a run there -- meets that dropped corner with its own undropped
+          -- edge.  Nothing closed the wedge between them, and it is the pair
+          -- of see-through triangles under the eaves of every Pokemon Center
+          -- and Mart: the front row is hipped where the building's corner
+          -- steps in, the row behind it is not.  Read per corner, because a
+          -- hip drops one side of the tile and not the other.
+          local function rowEdge(nty, southSide)
+            local nr = S.runs[keyOf(tx, nty)]
+            if not nr then return nil end
+            if (nr.rise or 0) <= 0 then return nr.h, nr.h end
+            local nd = nr.front - nty
+            local e = southSide and profileH(nr, nd + 1) or profileH(nr, nd)
+            local w, ee = e, e
+            if heightAt(tx - 1, nty) < nr.h then w = math.max(nr.h, e - 8) end
+            if heightAt(tx + 1, nty) < nr.h then ee = math.max(nr.h, e - 8) end
+            return w, ee
+          end
+          local function rowFlank(nw, nee, wY, eY, south)
+            local bW = math.max(run.h, math.min(nw or run.h, wY))
+            local bE = math.max(run.h, math.min(nee or run.h, eY))
+            if wY - bW < 0.5 and eY - bE < 0.5 then return end
+            if south then
+              push({ { x0, bW, z0 + 8 }, { x0 + 8, bE, z0 + 8 },
+                     { x0 + 8, eY, z0 + 8 }, { x0, wY, z0 + 8 } },
+                   { { u0, v1 }, { u1, v1 }, { u1, v0 }, { u0, v0 } },
+                   Voxel3D.FACE_SHADE[5])
+            else
+              push({ { x0 + 8, bE, z0 }, { x0, bW, z0 },
+                     { x0, wY, z0 }, { x0 + 8, eY, z0 } },
+                   { { u0, v1 }, { u1, v1 }, { u1, v0 }, { u0, v0 } },
+                   Voxel3D.FACE_SHADE[6])
+            end
+          end
+          local sw, se = rowEdge(ty + 1, true)
+          rowFlank(sw, se, swY, seY, true)
+          local nw2, ne2 = rowEdge(ty - 1, false)
+          rowFlank(nw2, ne2, nwY, neY, false)
         elseif run then
+          -- THE TOP OF A ROOM'S WALL IS NOT A ROOFTOP.
+          --
+          -- MOTIVATED BY BRENDAN'S BEDROOM (the clock over the desk) AND
+          -- PROFESSOR BIRCH'S LAB (the noticeboards over the benches).
+          --
+          -- `m = min(2, extent)` is here for a flat ROOFTOP: the top two rows
+          -- of a building's drawing are its eave and its roof, which is what
+          -- you look down on, and Petalburg's Gym needed them mapped once
+          -- across its depth rather than tiled.  A room's wall band is the
+          -- opposite kind of drawing -- `upright`, "a surface seen face-on"
+          -- in TileShape's own words -- and its top two rows are the ceiling
+          -- coping and whatever is hung high on the wall.  Laid flat they are
+          -- drawn a SECOND time, at right angles to the copy standing on the
+          -- face: Emerald's clock straddles the two cells of Brendan's band,
+          -- so it came out once lying on top of the wall and once standing on
+          -- the front of it, and the lab's noticeboards did the same.
+          --
+          -- Outdoors this never fires -- a building's top is its roof and the
+          -- roof pass draws it.  Indoors it fires only where the map HAS a
+          -- wall band, which is what `gen3RoomWallTop` records: a cave has
+          -- none, and a cave's rock really is drawn from above.  The panel is
+          -- the one `indoorShell` measured, so the band's top and the shell's
+          -- top are one continuous coping the whole way round the room.
+          local roomTop = nil
+          if S.isGen3 and not S.outdoor and S.gen3RoomWallTop
+             and not run.gen3RoofRows and s.class == "wall" then
+            roomTop = S.gen3RoomWallTop[(ty % 2) * 2 + (tx % 2) + 1]
+          end
           local m = math.min(2, run.extent)
-          local topTile = map:tileAt(tx, run.north + ((ty - run.north) % m))
+          if roomTop then
+            topQuad(x0, z0, h, roomTop, VOLUME_TOP_SHADE)
+          elseif S.isGen3 and run.extent > m then
+            -- SAME STRETCH AS THE GABLE ABOVE, for a flat-topped volume.
+            -- `(ty - run.north) % m` tiles the top two art rows down the
+            -- whole footprint, so Petalburg's Gym wore its eave course --
+            -- the pale grey-and-blue banding drawn once at the top of the
+            -- drawing -- three times across a flat tan roof. That banding
+            -- is the "scrambled gym roof" in the report. Mapping the same
+            -- two rows continuously over the depth draws each course once.
+            local d = ty - run.north
+            local band = m * 8
+            local p0 = (d / run.extent) * band
+            local p1 = ((d + 1) / run.extent) * band
+            local ai = math.floor(((p0 + p1) / 2) / 8)
+            if ai < 0 then ai = 0 end
+            if ai > m - 1 then ai = m - 1 end
+            local topTile = S.tileAt[keyOf(tx, run.north + ai)]
+                            or Gen3.tileAt(map, tx, run.north + ai)
+            local tv0 = math.max(0, math.min(7.5, p0 - ai * 8))
+            local tv1 = math.max(tv0 + 0.5, math.min(8, p1 - ai * 8))
+            topQuad(x0, z0, h, topTile, VOLUME_TOP_SHADE, nil, tv0, tv1)
+          else
+          local topTile = S.tileAt[keyOf(tx, run.north + ((ty - run.north) % m))]
+                          or Gen3.tileAt(map, tx, run.north + ((ty - run.north) % m))
           topQuad(x0, z0, h, topTile, VOLUME_TOP_SHADE)
+          end
         else
           local topTile = tile
-          if s.art == "upright" and s.authored then
+          local capV0, capV1 = nil, nil
+          if s.furnCap and s.art == "upright" and s.authored then
+            -- A STOOD-UP CARCASS WEARS ITS TOP ONCE, NOT ONCE PER TILE ROW.
+            --
+            -- MOTIVATED BY THE LAB BENCHES IN PROFESSOR BIRCH'S LAB,
+            -- LittlerootTown_ProfessorBirchsLab (0..3, 6..7).
+            --
+            -- A carcass is as tall as it is drawn, so its whole drawing is
+            -- spent on the face and `row < north` below fires for every one
+            -- of them: the fallback tops the box with the object's northmost
+            -- drawn row, and it does that for EACH 8px tile row of the
+            -- object's depth.  A bench two cells deep is four tile rows of
+            -- lid, so its worktop was drawn four times, one blank slab
+            -- behind another, with the bottle shelves crushed into the strip
+            -- of face left below them.
+            --
+            -- `Structures.standGen3Furniture` records where the object's top
+            -- really is drawn: the above-player art of the walkable row
+            -- BEHIND it, the very thing it tested to decide the object
+            -- stands at all.  That is what Emerald puts over your head when
+            -- you walk behind a bookcase -- its lid and whatever is standing
+            -- on it -- and it is one CELL of art however deep the object is.
+            -- So it maps CONTINUOUSLY across the depth, the same arithmetic
+            -- a stretched rooftop above already uses; a one-cell-deep object
+            -- is two art rows over two tile rows and lands 1:1.
+            local cap = s.furnCap
+            local dRow = ty - cap.north
+            if dRow < 0 then dRow = 0 end
+            if dRow > cap.ext - 1 then dRow = cap.ext - 1 end
+            local capBand = cap.rows * 8
+            local cp0 = (dRow / cap.ext) * capBand
+            local cp1 = ((dRow + 1) / cap.ext) * capBand
+            local ci = math.floor(((cp0 + cp1) / 2) / 8)
+            if ci < 0 then ci = 0 end
+            if ci > cap.rows - 1 then ci = cap.rows - 1 end
+            topTile = S.tileAt[keyOf(tx, cap.n + ci)] or topTile
+            capV0 = math.max(0, math.min(7.5, cp0 - ci * 8))
+            capV1 = math.max(capV0 + 0.5, math.min(8, cp1 - ci * 8))
+          elseif s.art == "upright" and s.authored then
             -- Top art for a pinned box.  A furniture drawing is top-view
             -- rows over floor(h/8) face-on rows the fold stands upright;
             -- a face row's top would repeat its front art lying flat, so
@@ -806,15 +1382,51 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
           -- on the pond.
           topQuad(x0, z0, h, topTile,
                   s.art == "upright" and VOLUME_TOP_SHADE or 1,
-                  (s.class == "water") and waterPush or nil)
+                  (s.class == "water") and waterPush or nil, capV0, capV1)
+        end
+
+        -- ...AND THE FOREST FLOOR UNDER THE BRIDGE.
+        --
+        -- Opening the gap under a deck leaves nothing at all in that cell
+        -- below it -- the map has one cell there and the bridge is what it
+        -- draws -- so Fortree's walkways became slots of open sky.  A span
+        -- crosses something, and what it crosses is whatever the ground does
+        -- either side of it: the lowest neighbour that is not itself deck,
+        -- painted flat at its own height.
+        if s.class == "bridge" then
+          local floorH, floorT = nil, nil
+          for _, side in ipairs(SIDES) do
+            local ntx, nty = tx + side[1], ty + side[2]
+            local ns = S.shapeAt[keyOf(ntx, nty)]
+            if ns and ns.class ~= "bridge" then
+              local nh2 = heightAt(ntx, nty)
+              if floorH == nil or nh2 < floorH then
+                floorH = nh2
+                floorT = S.tileAt[keyOf(ntx, nty)]
+              end
+            end
+          end
+          if floorT and floorH and h - floorH > 8 then
+            topQuad(x0, z0, floorH, floorT, 1)
+          end
         end
 
         -- sides: 8px bands wherever the neighbour is lower. Band k spans
         -- heights [8k, 8k+8) and shows one full tile of art; a partial
         -- band crops the art rows to match, so nothing ever stretches.
         for _, side in ipairs(SIDES) do
-          local nh = heightAt(tx + side[1], ty + side[2])
-          if nh < h then
+          local nh = occludeH(tx + side[1], ty + side[2])
+          -- A BRIDGE HAS AIR UNDER IT.
+          --
+          -- Every other cell is a column standing on the ground, so its side
+          -- faces run from the neighbour's height up to its own.  A bridge
+          -- deck is not: it spans a gap, and filling that gap made Fortree's
+          -- rope walkways solid piers of plank texture repeated the whole way
+          -- down to the forest floor.  A deck gets one course of fascia and
+          -- daylight below it.
+          local bottom = nh
+          if s.class == "bridge" and h - nh > 8 then bottom = h - 8 end
+          if bottom < h then
             local d = side[3]
             -- the columns flanking this face, for the inside-corner term:
             -- fixed for the whole face, so they are read once rather than
@@ -822,11 +1434,12 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
             local lat = LATERAL[d]
             local hl = lat and heightAt(tx + lat[1], ty + lat[2]) or 0
             local hr = lat and heightAt(tx + lat[3], ty + lat[4]) or 0
-            for band = math.floor(nh / 8), math.ceil(h / 8) - 1 do
-              local y0 = math.max(nh, band * 8)
+            for band = math.floor(bottom / 8), math.ceil(h / 8) - 1 do
+              local y0 = math.max(bottom, band * 8)
               local y1 = math.min(h, band * 8 + 8)
               if y1 > y0 then
                 local src, shade = tile, Voxel3D.FACE_SHADE[d]
+                local vT, vB = nil, nil
                 if run then
                   -- fold the structure's artwork up this face: band k
                   -- samples the map row k tiles north of the structure's
@@ -841,12 +1454,189 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
                   -- courses from the run's own datum instead.
                   local bb = band - math.floor((run.base or 0) / 8)
                   if bb < 0 then bb = 0 end
-                  if d == 6 then
-                    src = map:tileAt(tx, math.min(run.front,
-                                                  run.north + bb))
+                  -- ROCK TILES; A BUILDING DOES NOT.
+                  --
+                  -- The clamps below stop at the run's own drawing, so every
+                  -- course above it repeats ONE row -- a single 8px band of
+                  -- art smeared from there to the top. On a building that is
+                  -- invisible (its height is levelled to its drawing), but
+                  -- Hoenn's terrain is drawn as a short cliff-face motif on
+                  -- columns eight courses tall: Ever Grande's plateau came
+                  -- out as vertical streaks of one rock row, and so did every
+                  -- headland on the coastal routes.
+                  --
+                  -- Terrain wraps instead. The period is the run's own drawn
+                  -- unit -- the repeat the detector already measured in the
+                  -- art -- so a tall cliff reads as courses of the rock it is
+                  -- drawn from rather than as a smear. Only where Gen 3 says
+                  -- the column is NOT a building (no stated roof rows); a
+                  -- roofed column keeps the clamp, which is what stopped the
+                  -- Mart's emblem repeating up its face -- and so does any
+                  -- column whose art does NOT repeat, because a repeat is
+                  -- what tells a tiling texture from a drawing: the Ever
+                  -- Grande League's portico has no repeat in it, and tiling
+                  -- it stacked a second copy of the banner over the first.
+                  -- THE RESOLVED GRID, NOT THE RAW MAP.
+                  --
+                  -- `map:tileAt` answers what the cartridge draws at a cell;
+                  -- `S.tileAt` answers what this build decided goes there,
+                  -- and the two differ wherever Structures re-tiled a cell --
+                  -- a roof carrying a tree's overhanging leaves, a roof under
+                  -- a chimney. Folding from the raw map put the leaves back
+                  -- on the Petalburg Mart's roof after they had been removed.
+                  local function foldTile(row)
+                    return S.tileAt[keyOf(tx, row)] or Gen3.tileAt(map, tx, row)
+                  end
+                  local period = nil
+                  if S.isGen3 and not run.gen3RoofRows
+                     and (run.unit or 0) > 0 and run.extent > run.unit then
+                    -- a measured repeat says outright that the art tiles
+                    if run.fromRepeat then
+                      period = run.unit
+                    -- ...and so does sheer depth. Nothing built in Hoenn is
+                    -- eight cells deep; a column drawn that far back is a
+                    -- plateau, and walking its fold north samples the rock
+                    -- TOP for every course above the drawn face. The bound
+                    -- is deliberately far past any building so no facade can
+                    -- reach it.
+                    elseif run.extent >= 16 then
+                      period = run.unit
+                    end
+                  end
+                  -- Does this face have more courses than the drawing has
+                  -- rows?  Measured once for the whole face, and only where
+                  -- spreading is the right answer: Gen 3 terrain, no roof,
+                  -- no measured repeat.
+                  -- A RUN'S ART CAN REACH FURTHER NORTH THAN ITS RUN.
+                  --
+                  -- A run is built from BLOCKED cells, and Emerald draws the
+                  -- top of a tall structure on the above-player layer so you
+                  -- can walk behind it.  Those rows carry no run, so the
+                  -- facade had two cell rows of art to spread over six cells
+                  -- of Mirage Tower and stretched them -- the smeared rungs
+                  -- on the raised building.  `foundGen3Buildings` records
+                  -- where the drawing really starts; use it wherever the
+                  -- facade asks how many rows it has to work with.
+                  local artNorth = run.gen3ArtNorth or run.north
+                  if artNorth > run.north then artNorth = run.north end
+                  -- A ROOM'S WALL CARRIES ON PLAIN ABOVE ITS DRAWING.
+                  --
+                  -- MOTIVATED BY BRENDAN'S HOUSE 1F, the windows over the
+                  -- kitchen.  The room's wall band is two cells; the stair
+                  -- head cut into it at (7..10, 2) is three, and one roofline
+                  -- per building levels the whole wall to the taller reading
+                  -- -- 48px of face over four rows of drawing.  `stretched`
+                  -- then spreads those four rows over six courses and the
+                  -- window's lower half is drawn in two of them.
+                  --
+                  -- `stretched` is a CLIFF rule and says so: "the drawing is
+                  -- the whole drop, so spread it over the whole drop".  A
+                  -- room's wall is not a drop.  Its drawing is the wall from
+                  -- the floor to wherever the artist stopped, and above that
+                  -- the wall carries on to the ceiling in the plain panel the
+                  -- rest of the room is made of -- the one `indoorShell`
+                  -- measured and the shell already wears.  So the fold stays
+                  -- one drawn row per course from the floor, and the courses
+                  -- past the drawing wear the panel instead of clamping on
+                  -- the last row or stretching to reach.
+                  local roomWall = nil
+                  if S.isGen3 and not S.outdoor and S.gen3RoomWallTop
+                     and not run.gen3RoofRows and s.class == "wall" then
+                    roomWall = S.gen3RoomWallTop
+                  end
+                  local stretched = false
+                  if S.isGen3 and not roomWall
+                     and not run.gen3RoofRows and not period
+                     and not run.door and (run.front or 0) >= (artNorth or 0)
+                  then
+                    local faceH = h - bottom
+                    local rows = run.front - artNorth + 1
+                    if rows >= 1 and faceH > rows * 8 then stretched = true end
+                  end
+
+                  -- THE FACADE FOLDS AT ITS DRAWN SIZE.
+                  --
+                  -- Two earlier cuts tried to keep the wall's courses off
+                  -- the roof's rows: clamping the fold drew the P.C sign
+                  -- three times, and stretching the shopfront over the wall
+                  -- drew it once at twice its height -- the stretched doors
+                  -- on every Center and house.  The Mart never had either
+                  -- problem and does neither: it folds one drawn row per 8px
+                  -- course from its front and stops at its own north edge.
+                  -- So does everything else now.
+                  -- A CLIFF FACE WEARS ITS OWN DRAWING, ONCE, TOP TO BOTTOM.
+                  --
+                  -- Structures marks a run that is a step between two stated
+                  -- levels rather than a thing standing on one (`run.face`).
+                  -- Its drawn rows ARE the drop: the row nearest the high
+                  -- ground is the crest and the row nearest the low ground
+                  -- is the foot, so they map continuously over the face
+                  -- instead of one row per 8px course.  Eight rows of rock
+                  -- over a 32px step then read as the cliff the cartridge
+                  -- draws, at whatever depth the step happens to be, with
+                  -- nothing stretched and nothing repeated.
+                  if run.face then
+                    local faceH = h - bottom
+                    local rows = run.face.rows or 1
+                    local idx = 0
+                    if faceH > 0 and rows > 0 then
+                      local tm = ((h - y1) + (h - y0)) / (2 * faceH)
+                      idx = math.floor(tm * rows)
+                      if idx < 0 then idx = 0 end
+                      if idx > rows - 1 then idx = rows - 1 end
+                    end
+                    if run.face.dir == "north" then
+                      src = foldTile(run.front - idx)
+                    else
+                      src = foldTile(run.north + idx)
+                    end
+                  elseif stretched then
+                    -- ...AND SO DOES ANY FACE TALLER THAN ITS DRAWING.
+                    --
+                    -- One row per 8px course is right only while there are
+                    -- rows left.  Past that the clamps below hold the last
+                    -- one, so a rock band two cells deep standing four
+                    -- courses wears its bottom row twice and its top row
+                    -- twice: the smear you see wherever cliff edges stack,
+                    -- and there are 103 of those runs in Mossdeep alone.
+                    --
+                    -- The drawing is the whole drop, so spread it over the
+                    -- whole drop -- the same continuous mapping a stated
+                    -- `run.face` gets, applied wherever the geometry says
+                    -- the face has outrun its art.  Buildings are exempt:
+                    -- a facade's courses ARE its bands and its top row is
+                    -- meant to carry the wall above the drawing.  So is a
+                    -- run with a measured repeat, which tiles on purpose.
+                    local faceH = h - bottom
+                    local rows = run.front - artNorth + 1
+                    local tm = ((h - y1) + (h - y0)) / (2 * faceH)
+                    local idx = math.floor(tm * rows)
+                    if idx < 0 then idx = 0 end
+                    if idx > rows - 1 then idx = rows - 1 end
+                    if d == 6 then
+                      src = foldTile(artNorth + idx)
+                    else
+                      src = foldTile(run.front - idx)
+                    end
+                  elseif d == 6 then
+                    if period then
+                      src = foldTile(artNorth + (bb % period))
+                    elseif roomWall and artNorth + bb > run.front then
+                      -- past the drawing: the plain panel (see above)
+                      src = roomWall[((artNorth + bb) % 2) * 2 + (tx % 2) + 1]
+                            or src
+                    else
+                      src = foldTile(math.min(run.front, artNorth + bb))
+                    end
                   else
-                    src = map:tileAt(tx, math.max(run.north,
-                                                  run.front - bb))
+                    if period then
+                      src = foldTile(run.front - (bb % period))
+                    elseif roomWall and run.front - bb < artNorth then
+                      src = roomWall[((run.front - bb) % 2) * 2 + (tx % 2) + 1]
+                            or src
+                    else
+                      src = foldTile(math.max(artNorth, run.front - bb))
+                    end
                   end
                   if d == 5 then shade = 1 end
                 elseif s.art == "upright" then
@@ -868,14 +1658,93 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
                       break
                     end
                   end
-                  local fk = keyOf(tx, front - band)
-                  local fs = S.shapeAt[fk]
-                  if fs and fs.authored and fs.class == s.class then
-                    src = S.tileAt[fk]
+                  -- FURNITURE IS DRAWN ONCE, NOT STACKED.
+                  --
+                  -- Band k samples the row k tiles north of the object's
+                  -- front, and past the top of its own drawing that lookup
+                  -- fails and `src` falls back to the cell's own tile --
+                  -- so every further band repeats the last row. May's
+                  -- shelf unit is one cell of art in a 26px box and came
+                  -- out as four identical drawers in a tower through the
+                  -- ceiling; Brendan's console and every other pinned
+                  -- upright taller than its picture did the same.
+                  --
+                  -- On Gen 3 the drawing is mapped CONTINUOUSLY over the
+                  -- box instead -- the same repair the roofs got. Where
+                  -- the box is exactly as tall as the drawing the slices
+                  -- land on row boundaries and this is the old behaviour
+                  -- exactly; where it is taller the picture stretches, and
+                  -- a piece of furniture is its picture once at whatever
+                  -- height its class says it stands.
+                  -- The drawing this object owns: its contiguous same-class
+                  -- rows. `authored` is deliberately NOT required here --
+                  -- the commonest case is an unpinned one-cell box (a town
+                  -- sign left standing when its column was trimmed out of a
+                  -- house), and requiring a pin left exactly those cells on
+                  -- the repeating path this branch exists to replace.
+                  local rows = 0
+                  while rows < 6 do
+                    local rk = keyOf(tx, front - rows)
+                    local rs = S.shapeAt[rk]
+                    -- ...and it stops at the next STRUCTURE. Dropping the
+                    -- `authored` requirement let the scan walk out of the
+                    -- object and up into whatever shared its class: the sign
+                    -- in front of Birch's lab is a plain `wall` cell and so
+                    -- is the lab wall behind it, so the scan took six rows of
+                    -- laboratory and squashed them onto a 16px sign. A cell
+                    -- that carries a run belongs to a measured volume and is
+                    -- somebody else's drawing.
+                    if rs and rs.class == s.class and not S.runs[rk]
+                       and not S.skip[rk] then
+                      rows = rows + 1
+                    else
+                      break
+                    end
+                  end
+                  if S.isGen3 and rows > 0 and h > 0 then
+                    local artH = rows * 8
+                    local p0 = (y0 / h) * artH
+                    local p1 = (y1 / h) * artH
+                    local ri = math.floor(((p0 + p1) / 2) / 8)
+                    if ri < 0 then ri = 0 end
+                    if ri > rows - 1 then ri = rows - 1 end
+                    local sk = keyOf(tx, front - ri)
+                    src = S.tileAt[sk] or src
+                    vB = math.min(8, math.max(0.5, 8 - (p0 - ri * 8)))
+                    vT = math.max(0, math.min(vB - 0.5, 8 - (p1 - ri * 8)))
+                  else
+                    local fk = keyOf(tx, front - band)
+                    local fs = S.shapeAt[fk]
+                    if fs and fs.authored and fs.class == s.class then
+                      src = S.tileAt[fk]
+                    end
+                  end
+                end
+                -- A CAVE'S DROP IS ONE DRAWING, NOT A STACK OF THEM.
+                --
+                -- The band rule -- each 8px course wears one whole tile of
+                -- art, partial bands cropped -- is right for a texture that
+                -- tiles, and a cave's rock does not: the ridge tile is the
+                -- FACE, drawn once, with its brow at the top and its foot
+                -- at the bottom.  Stacked two or four deep it reads as the
+                -- same lip repeated down the drop, which is the stretched
+                -- look on cliff edges.
+                --
+                -- So a rock cell (marked by buildGen3RockPlateaus, and only
+                -- those -- every other flat cell keeps the band rule it was
+                -- tuned with) maps its own tile CONTINUOUSLY over the whole
+                -- face.  Where the drop is exactly one course this is the
+                -- old behaviour to the pixel.
+                if s.rock and vT == nil and vB == nil then
+                  local faceH = h - bottom
+                  if faceH > 8 then
+                    vT = 8 * (h - y1) / faceH
+                    vB = 8 * (h - y0) / faceH
                   end
                 end
                 sideQuad(d, x0, z0, y0, y1, src,
-                         (band * 8 + 8) - y1, (band * 8 + 8) - y0,
+                         vT or ((band * 8 + 8) - y1),
+                         vB or ((band * 8 + 8) - y0),
                          sideShades(hl, hr, y0, y1, y0 <= nh, shade))
               end
             end
@@ -978,7 +1847,59 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
   local sc = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }
   for _, st in ipairs(S.roundStamps or {}) do
     local mx, mz = st.mx, st.mz
+    -- A STAMP CAN STAND ABOVE THE FLOOR.
+    --
+    -- Every hull in this system was placed with its feet on the world datum,
+    -- because every hull so far -- a tree, a stump, a bin, a potted plant --
+    -- stands on the ground. A rooftop object does not: Birch's lab has a
+    -- ventilation drum on its roof, and stamped at y = 0 it would be buried
+    -- inside the building with only its lid showing. `my` lifts a stamp to
+    -- the surface it stands on; absent, the whole system behaves exactly as
+    -- it did.
+    local my = st.my or 0
     local sr = st.r or 8
+    -- ...AND THE FLOOR IT STANDS ON IS THE ONE PAINTED UNDER IT.
+    --
+    -- MOTIVATED BY MOSSDEEP CITY'S SOUTH SHORE (35..42, 30..39) -- the block
+    -- of trees Emerald draws standing in the sea, which the user's 2D/3D pair
+    -- shows as bare pale-green BOXES with no crown on them at all.
+    --
+    -- A claimed cell's floor is repainted by the branch above at
+    -- `heightAt` = `Structures.stampGround` -- the shape's own `base` when a
+    -- pass recorded one, and `Structures.standHeight` when none did.  The
+    -- hull was placed at `standZ`, a DIFFERENT reading taken in
+    -- `buildCylinders`, and the two disagree wherever `markStand` declined to
+    -- record a base: it opens `if not z or z <= 0 then return end`, so a tree
+    -- whose own ground reads the water or the datum keeps `base = nil` and
+    -- its floor falls through to `standHeight` -- which is written to ignore
+    -- water (`ns.class ~= "water"`) and answers with the nearest DRY LAND up
+    -- to three cells away.  Mossdeep (40,31) stamps its hull at -2 and paints
+    -- its floor at 48: the tree is drawn fifty pixels under its own floor,
+    -- and all that is left in the frame is the floor -- a grass-topped box
+    -- standing in the sea with the tree buried inside it.
+    --
+    -- Measured over the 81 outdoor maps, 2,591 of 16,055 hulls (16.1%) stand
+    -- below the floor painted on their own cell: 2,115 where `standZ` had no
+    -- reading at all (the border ring and the inside of a thicket, where the
+    -- floor from the apron is the better answer) and 473 where it read the
+    -- water.  Worst 68px on Mossdeep, 70 on Route 123, 54 on Route 113.
+    --
+    -- The fix asks the floor, not a second opinion about it: `heightAt` on
+    -- the hull's own anchor cell is the very number the ground quad above is
+    -- painted at, memoised in the same table.  No shape, height, run or
+    -- ground tile moves -- only the hull's own quads translate -- so relief,
+    -- pits, seams and see-through are identical by construction.
+    --
+    -- Gen 3 outdoors only: on Gen 1, Gen 2 and Prism `standZ` returns nil for
+    -- want of `synthZ`, `my` is already 0, and this leaves it there.
+    if S.isGen3 then
+      local acx = math.floor((mx - sr) / 16) * 2
+      local acz = math.floor((mz - sr) / 16) * 2
+      if S.skip[keyOf(acx, acz)] then
+        local fy = heightAt(acx, acz)
+        if type(fy) == "number" then my = fy end
+      end
+    end
     local sx0, sz0, sx1, sz1 = mx - sr, mz - sr, mx + sr, mz + sr
     local interior = sx0 > 0 and sx1 < bw and sz0 > 0 and sz1 < bh
     local overBody = sx1 > 0 and sx0 < bw and sz1 > 0 and sz0 < bh
@@ -996,7 +1917,7 @@ local function runGeometry(map, bodyOnly, masks, sink, waterSink)
         for i = 1, 4 do
           local c, s2 = q[i], sc[i]
           s2[1] = c[1] + mx
-          s2[2] = c[2]
+          s2[2] = c[2] + my
           s2[3] = c[3] + mz
         end
         local ok = keepAll
@@ -1062,6 +1983,15 @@ end
 -- the current rules, which is what makes a second prebake pass cheap.
 function ChunkMesher.bake(map, slot, masks)
   slot = slot or "body"
+  -- A FULL bake has to carry the same rectangles the live request will, or
+  -- it writes an entry under a key nothing ever looks up. The host installs
+  -- the resolver (VoxelScene.masksFor); with none there is nothing honest to
+  -- bake for that slot, so say so rather than write a file that will miss.
+  if slot ~= "body" and masks == nil then
+    local resolve = ChunkMesher.masksFor
+    masks = (type(resolve) == "function") and resolve(map) or nil
+    if masks == nil then return false, "no mask resolver for the full slot" end
+  end
   if not DiskCache then return false, "no disk cache" end
   if type(DiskCache.enabled) == "function" and not DiskCache.enabled() then
     return false, "disabled"
@@ -1203,6 +2133,17 @@ local function jobKey(id, slot)
   return id .. ":" .. slot
 end
 
+-- WHY A MAP HAS NO MESH.  `request` answers nil both for "queued, not built
+-- yet" and for "the build threw and false is cached", and those two are the
+-- same thing to the caller and completely different to a person looking at a
+-- flat world that will not turn 3D.  A failed slot is never retried, so the
+-- first reading is a wait and the second is forever.
+local buildErrors = {}
+
+function ChunkMesher.buildFailure(mapId)
+  return buildErrors[mapId]
+end
+
 local function finishJob(job, ok, err)
   jobIndex[jobKey(job.id, job.slot)] = nil
   for i, j in ipairs(jobs) do
@@ -1213,8 +2154,14 @@ local function finishJob(job, ok, err)
   end
   if not ok then
     -- name the reason: in a real session a lost build is a black map
+    buildErrors[job.id] = tostring(err)
     print("[warn] voxel mesh build failed for " .. tostring(job.id)
           .. ": " .. tostring(err))
+    pcall(function()
+      require("src.core.Logger").warn(
+        "voxel mesh build failed for %s (%s): %s", tostring(job.id),
+        tostring(job.slot), tostring(err))
+    end)
     if (gen[job.id] or 0) == job.gen then
       entry(job.id)[job.slot] = false
     end
@@ -1349,6 +2296,27 @@ local URGENT_SLICE = 0.012
 local IDLE_SLICE = 0.005
 local COVERED_SLICE = 0.030
 
+-- A COLD MAP HAS NOTHING TO PROTECT.
+--
+-- The adaptive slice below exists to stop meshing from turning a busy frame
+-- into a dropped one -- it measures what the rest of the frame costs and
+-- hands the build a share of the headroom.  That is exactly right while the
+-- voxel world is ON SCREEN and a hitch is visible.
+--
+-- Before the first chunk of a map is built there is no voxel world on screen:
+-- the mode is drawing the flat 2D fallback, which costs almost nothing, and
+-- the player is waiting for the relief to appear.  Protecting a frame that
+-- has nothing in it spends the whole wait defending against a hitch that
+-- cannot happen, and it is the "the voxels take a bit of time to activate"
+-- report.
+--
+-- So while a map has no cached mesh at all, the urgent job gets a fixed slice
+-- twice the on-screen ceiling.  Deliberately not the covered slice: the 2D
+-- fallback is still being drawn and the player can still walk about in it, so
+-- the frame has to keep moving -- 24 ms leaves better than 40 fps on a host
+-- with no headroom, against 12 ms and twice the wait.
+local COLD_SLICE = 0.024
+
 -- The fixed slices above are a CEILING, not a target. On a machine with room
 -- to spare they are never reached; on a machine already missing its frame,
 -- spending a flat 12 ms on top of an already-full frame is what turns a busy
@@ -1390,6 +2358,37 @@ end
 function ChunkMesher.lastSlice() return lastSpend end
 
 function ChunkMesher.pump(covered)
+  -- A SEAM IS FINISHED WHEN BOTH SIDES HAVE SEEN EACH OTHER.
+  --
+  -- `Structures.smoothGen3Seams` meets a neighbour halfway from the two RAW
+  -- edge profiles, so both sides reach the same midpoint in either order --
+  -- but only once the neighbour's profile has been recorded, which means
+  -- built.  The map built FIRST sees nothing and leaves its edge alone, and
+  -- nothing ever asks it again: its analysis is cached and its mesh is on the
+  -- GPU.  The seam then settles at HALF a step -- eight pixels of wall where
+  -- there should be none -- for the rest of the session.
+  --
+  -- The pass lists the neighbour that missed us in `Structures.gen3SeamDirty`,
+  -- once per PAIR.  Refreshing it here rebuilds it in place, with the stale
+  -- mesh still drawing, and its seam pass then finds our profile on record.
+  -- Route 109 / Slateport, whose seam is 36 cells of floor a course apart:
+  -- built in that order it settles at 28 cells of eight-pixel step, and one
+  -- refresh of Route 109 takes it to 36 cells flush.  It cannot loop: the
+  -- pair is marked before the request and the rebuilt map asks for nothing
+  -- back.
+  local seamDirty = Structures.gen3SeamDirty
+  if seamDirty then
+    local due = nil
+    for id in pairs(seamDirty) do
+      seamDirty[id] = nil
+      -- nothing cached means nothing drawn from the stale edge: the next
+      -- build will read our profile anyway
+      if cache[id] then due = due or {}; due[#due + 1] = id end
+    end
+    if due then
+      for _, id in ipairs(due) do ChunkMesher.refresh(id) end
+    end
+  end
   if #jobs == 0 then lastSpend = 0 return end
   local pick = jobs[1]
   for _, j in ipairs(jobs) do
@@ -1399,7 +2398,13 @@ function ChunkMesher.pump(covered)
     end
   end
   local started = clock()
-  local slice = sliceFor(pick.urgent, covered)
+  -- nothing of this map is meshed yet: see COLD_SLICE
+  local cold = false
+  if pick.urgent and not covered then
+    local cc = cache[pick.id]
+    if not (cc and (cc.full or cc.body)) then cold = true end
+  end
+  local slice = cold and COLD_SLICE or sliceFor(pick.urgent, covered)
   local deadline = started + slice
   while pick do
     if not pick.co then

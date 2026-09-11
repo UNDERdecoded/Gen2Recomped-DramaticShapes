@@ -50,6 +50,7 @@
 local V = ...
 
 local Budget = V.require("BuildBudget")
+local Gen3 = V.require("Gen3")
 
 local Buildings = {}
 
@@ -1206,8 +1207,15 @@ function Buildings.build(S, map, data, perRow)
   local list = s and s.buildings and s.buildings[tileset.id]
   if not list then return end
 
-  local atlasW = tileset.imageWidth or 128
-  local atlasH = tileset.imageHeight or 48
+  -- ASK GEN 3 FOR ITS OWN SHEET. `imageWidth or 128` / `imageHeight or 48`
+  -- are Gen 1 facts; on a Hoenn pair they name a sheet that does not exist,
+  -- and every UV stamped from this model would land dozens of tile rows away
+  -- from the art it was measured on. See Structures.geomOf.
+  local atlasW, atlasH = tileset.imageWidth or 128, tileset.imageHeight or 48
+  if Gen3.isGen3(tileset) then
+    local okG, info = pcall(Gen3.describe, tileset)
+    if okG and info then atlasW, atlasH = info.width, info.height end
+  end
   local tw, th = map.def.width * 4, map.def.height * 4
   local quads = S.objectQuads
 

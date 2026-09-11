@@ -30,11 +30,21 @@ local clock = (love and love.timer and love.timer.getTime) or os.clock
 
 local state = nil
 
--- Slots to bake per map, in the order they matter. BODY first because it is
--- the one every neighbour needs and the one whose key is stable; FULL is
--- skipped entirely -- its key carries the resident-neighbour rectangles, so a
--- guessed set would bake an entry nothing ever asks for.
-local SLOTS = { "body" }
+-- Slots to bake per map. FULL, and only FULL.
+--
+-- FULL used to be skipped entirely -- its key carried the resident-neighbour
+-- rectangles, so a guessed set would bake an entry nothing ever asks for --
+-- and BODY was baked instead, because a neighbour drew that one. Since
+-- VoxelScene.masksFor both halves of that have turned over: the ring is cut
+-- against the map's OWN neighbourhood rather than the player's, so the full
+-- key no longer depends on where anyone is standing and bakes like any
+-- other; and every map in the frame now draws the full mesh, neighbours
+-- included, so nothing asks for the ring-less one at all.
+--
+-- It is also the expensive slot -- a ringed mesh is about 1.25x the region's
+-- body geometry -- which is exactly what a prebake is for: paid once, ahead
+-- of anyone walking in, instead of in the slices a frame can spare.
+local SLOTS = { "full" }
 
 local function reset()
   state = nil

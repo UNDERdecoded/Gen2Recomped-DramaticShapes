@@ -41,6 +41,11 @@
 -- the mod namespace (see main.lua): V.data loads a shipped data file
 local V = ...
 
+-- The Gen 3 arm.  Loaded eagerly and used only behind `Gen3.isGen3(tileset)`,
+-- which is false on every Gen 1 and Gen 2 tileset in existence, so nothing
+-- below this line changes for Kanto, Johto or Prism.
+local Gen3 = V.require("Gen3")
+
 local TileShape = {}
 
 -- class -> height fallbacks, used when data/voxel_heights.lua is missing
@@ -103,6 +108,12 @@ local FALLBACK_HEIGHTS = {
   -- the drawing's own straight run is only a couple of rows, because a GB
   -- cell spends most of itself on the opening
   can = 9,
+  -- A DRUM ON A ROOF, not on the floor: Birch's lab wears a ventilation
+  -- stack, and Hoenn's civic roofs carry vents and flues drawn the same way.
+  -- Two cells wide and two tall of drawing over a footprint on the roof
+  -- below it, so it is carved by Structures.buildRoofProps AFTER the volume
+  -- pass -- the only pass that knows how high the roof it stands on is.
+  chimney = 24,
   -- round scenery drawn ONE cell wide and TWO cells TALL, standing on one
   -- cell of plot: the Pokemon Centers' potted plants. Carved as one
   -- 16x32x16 hull in the SOUTH (pot) cell -- the drawing's upper cell is
@@ -145,6 +156,63 @@ local FALLBACK_HEIGHTS = {
   stair_w = 16,
   stair_down_e = 16,
   stair_down_w = 16,
+  -- THE THREE GEN 3 CLASSES (lib/Gen3.lua, data/gen3_shapes.lua).
+  --
+  -- A BRIDGE DECK.  Not a `terrace`, which is the top of a mass of rock and
+  -- has that mass under it: a bridge is a thin plate with daylight and
+  -- usually water underneath, and Emerald says so outright by giving the deck
+  -- elevation 15 over an elevation-1 sea.  Four pixels is a plank's edge --
+  -- the height it stands AT comes from the cell, not from here.
+  -- ------------------------------------------------------------- GEN 3
+  -- FURNITURE.  Gen 2's collision classes know about counters and bookshelves
+  -- and nothing else; Emerald names the television, the fridge, the vase and
+  -- the sink one at a time, and its interiors are built out of them.
+  --
+  -- Only `flat`, `top` and `upright` are used for these, deliberately. The
+  -- richer art modes -- billboard, relief, bookcase, cylinder -- are all
+  -- carved from ATLAS PIXELS by Structures, and Structures reads no pixels on
+  -- Gen 3 (there is no sheet on disk). A class whose art mode cannot be built
+  -- would silently fall back to a plain box, so it is better not to name one.
+  --
+  -- A CHAIR is drawn from above and you sit at seat height.  Emerald leaves
+  -- chair cells PASSABLE -- you walk over them -- so this is one of the few
+  -- places a pin deliberately raises ground you can stand on: stepping onto a
+  -- chair and standing 8px up is what the drawing depicts.
+  chair = 8,
+  -- A TABLE TOP: the cloth is drawn from above, and the legs are the drawing's
+  -- own shadow. Waist height.
+  tabletop = 12,
+  -- A CARCASS: the body of a piece of interior furniture that STANDS UP --
+  -- a bookcase, a lab bench, a bank of lockers, a slot machine.  Its
+  -- height is not a property of the class: it is one course for each map
+  -- row the object is drawn in, written per cell by
+  -- Structures.standGen3Furniture, which is also the only thing that
+  -- resolves this class.  Sixteen here so a build that somehow reaches it
+  -- without that pass gets one honest course rather than nothing.
+  carcass = 16,
+  -- A KITCHEN UNIT: counter height, with its front panel standing.
+  worktop = 18,
+  -- A SINK is the same carcass with a basin in its top.
+  sink = 18,
+  -- A FRIDGE. Two cells of drawing -- the door above, the body below -- and
+  -- one box: the mesher's authored-upright fold walks NORTH up the column,
+  -- so the front cell wears its own art low and the wall cell's art high.
+  appliance = 30,
+  -- A DRESSER or a glass-fronted cabinet: shoulder height, not ceiling.
+  cabinet = 26,
+  -- A TELEVISION on its stand, and the console beside it.
+  tv = 22,
+  bridge = 4,
+  -- A FLOATING LOG.  Pacifidlog's rafts ride on the sea rather than over it,
+  -- and the town draws each one in three vertical states (floating, half
+  -- submerged, submerged).  Two pixels of freeboard reads as a log in the
+  -- water; anything more reads as a jetty.
+  log = 2,
+  -- A RAMP between two elevations -- a muddy or bumpy slope.  Height zero on
+  -- purpose: the cells on either side already differ by a course, and the
+  -- slope's job is to be the surface between them rather than a step of its
+  -- own.
+  slope = 0,
 }
 
 -- class -> how the mesher draws it (see the header). The last three are
@@ -157,9 +225,20 @@ local FALLBACK_HEIGHTS = {
 --              stands alone in its own depth band -- a north-south fence
 --              line is a march of separate posts, not one tall drawing
 --              (which is what a shared cluster would make of it)
---   grass      tall grass: flat ground PLUS two thin standing rows of
---              tufts per tile (the art's top and bottom halves), each at
---              its drawn depth -- the player walks between them
+--   grass      tall grass.  TWO DIFFERENT THINGS under one name, because
+--              the two cartridge families draw tall grass two different
+--              ways.  On Gen 1 and Gen 2 it is a small clump on a
+--              transparent field, so it is flat ground PLUS two thin
+--              standing rows of tufts per tile (the art's top and bottom
+--              halves), each at its drawn depth -- the player walks
+--              between them.  On Gen 3 the same behaviour is a FULL-BLEED
+--              TEXTURE -- 71 scattered pixels of 256, nothing on the
+--              above-player layer -- which is a plan of a grass surface
+--              rather than a silhouette, so Hoenn gets a low mat wearing
+--              that plan on its top face instead (Structures'
+--              buildGen3Grass, which argues the measurement).  Hoenn's
+--              long grass and ash grass share this class and take NO
+--              geometry: see data/gen3_shapes.lua's `grass_kind`.
 local ART = {
   ground = "flat",
   water = "flat",
@@ -241,6 +320,24 @@ local ART = {
   stair_w = "stair",
   stair_down_e = "stair",
   stair_down_w = "stair",
+  bridge = "top",
+  log = "top",
+  slope = "top",
+  -- drawn from above -> the art rides the box's TOP face
+  chair = "top",
+  tabletop = "top",
+  -- ...and a carcass is the same furniture seen the other way up: its
+  -- picture folds UP its south face, band by band, which is what puts the
+  -- book spines on the front of the shelf instead of on its lid
+  carcass = "upright",
+  -- drawn face-on -> the art folds UP the box's south face, band by band
+  worktop = "upright",
+  sink = "upright",
+  appliance = "upright",
+  cabinet = "upright",
+  tv = "upright",
+  -- carved as a hull standing on the roof; no fold, no box (see above)
+  chimney = "chimney",
 }
 
 --- The class vocabulary, published: every class this file resolves against,
@@ -432,6 +529,40 @@ local function shapeFor(class, heights, authored)
            authored = authored or false }
 end
 
+-- Gen 3 shapes carry an ABSOLUTE height -- the class's own plus the ground
+-- elevation under the cell -- so they cannot be the shared per-class records
+-- the rest of the file hands out.  Memoised on (class, height) rather than
+-- built per call, because `at` runs once per 8px tile of the map and its
+-- apron, which on Route 119 is about eighty thousand calls per rebuild.
+local gen3Shapes = {}
+local function gen3Shape(class, h, pinned)
+  local key = class .. "\0" .. h .. (pinned and "\0p" or "")
+  local hit = gen3Shapes[key]
+  if hit then return hit end
+  local art = ART[class] or "upright"
+  local rec = {
+    class = class, h = h, art = art,
+    flat = art == "flat" or class == "grass" or class == "flower",
+    -- Ground-like answers are AUTHORED: Emerald stated them and no later
+    -- guess should overrule them.  Cover is NOT, deliberately -- an unauthored
+    -- upright is what `Structures` floods into regions and measures the height
+    -- of, and that measurement is the only thing that makes a house in
+    -- Rustboro three courses tall instead of one.  Marking these authored was
+    -- the difference between a city and a car park.
+    --
+    -- A PINNED cell is authored whatever its art, and that is the whole point
+    -- of pinning one. An unauthored upright JOINS THE FLOOD: the fridge, the
+    -- wall behind it and the wall above were one region, measured as one run,
+    -- and came out as a single 48px slab three cells deep -- the wall dragged
+    -- forward around the fridge instead of the fridge standing out from the
+    -- wall. Authored, it leaves the flood and becomes its own box.
+    authored = pinned or (art ~= "upright"),
+    gen3 = true,
+  }
+  gen3Shapes[key] = rec
+  return rec
+end
+
 -- Resolved TILE-LEVEL shapes for the tileset `map` uses: a list indexed by
 -- tile id holding { class, h, art, flat, authored }, plus `classes`, one
 -- canonical shape per class for the cell-level overrides in TileShape.at.
@@ -463,8 +594,33 @@ function TileShape.forMap(map)
     end
   end
   local authored = authoredGroups(id, heights)
-  local count = math.floor((tileset.imageWidth or 128) / 8)
-                * math.floor((tileset.imageHeight or 48) / 8)
+
+  -- HOW BIG THE TILE-ID SPACE IS.
+  --
+  -- Gen 1 and Gen 2 answer this from the atlas: it is a grid of 8x8 tiles and
+  -- the id is a position in it.  A Gen 3 pair has no atlas of tiles at all --
+  -- it has METATILES, 16x16 apiece, and the mod addresses each one as four
+  -- synthetic 8px tiles so that every consumer downstream can go on treating
+  -- a tile id as an opaque number (see lib/Gen3.lua).  Sizing that space with
+  -- the Gen 1 arithmetic gave 128/8 * 48/8 = 96 ids for a pair that really
+  -- has some three and a half thousand, so every metatile past the 24th
+  -- resolved to nil and `TileShape.at` dropped the cell without meshing it --
+  -- which is most of Hoenn, silently.
+  -- Same split as Structures and ChunkMesher: `isGen3` is a pure test on the
+  -- tileset and always answerable, while the CONTEXT can fail for reasons
+  -- unrelated to the world's shape.  Sizing the id space off a failed context
+  -- would fall back to Gen 1's 96 ids and drop most of Hoenn unmeshed, and
+  -- taking the Gen 2 collision branch below would resolve every cell through
+  -- the wrong numbering -- both silent.
+  local isGen3 = Gen3.isGen3(tileset)
+  local gen3 = isGen3 and Gen3.forMap(map) or nil
+  local count
+  if isGen3 then
+    count = Gen3.tileCount(Gen3.idSpace(tileset, gen3))
+  else
+    count = math.floor((tileset.imageWidth or 128) / 8)
+            * math.floor((tileset.imageHeight or 48) / 8)
+  end
 
   -- derived pin: a tile the tileset animates by FRAME REWRITE (the
   -- overworld's flower) is already named by its animation spec, so like
@@ -510,7 +666,13 @@ function TileShape.forMap(map)
   -- the lone tree and the tree WALL are drawn from the same six tiles and
   -- differ only here.  Only Gen 2 tilesets ship the table, so its presence is
   -- also the gate (map:cellTile answers a tile id without it).
-  if tileset.collision then
+  -- NOT ON GEN 3.  A Gen 3 pair record carries a `collision` field too -- the
+  -- behaviour byte, one per metatile -- and it is a completely different
+  -- numbering: $02 is tall grass there and a wall class here, $14 is water
+  -- here and Sootopolis' deep water there.  Read through this table a Gen 3
+  -- map does not fail, it comes out WRONG, cell by cell, with no error
+  -- anywhere.  The behaviour byte has its own table in data/gen3_shapes.lua.
+  if tileset.collision and not isGen3 then
     local s = load()
     local classes = (s and s.collision) or {}
     -- Prism keeps the layout and reassigns the object classes, so its rows
@@ -541,7 +703,7 @@ function TileShape.forMap(map)
   -- ground.  Where a class table exists the cell rules in TileShape.at are
   -- the whole truth and a solid tile has no business being anything but
   -- solid, so the derived per-tile pins below are Gen 1's alone.
-  local perTile = not tileset.collision
+  local perTile = not tileset.collision and not isGen3
 
   for t = 0, count - 1 do
     local class = authored[t]
@@ -557,11 +719,22 @@ function TileShape.forMap(map)
       shapes[t] = shapes.classes.water
     elseif perTile and map.walkable and map.walkable[t] then
       shapes[t] = shapes.classes.ground
+    elseif isGen3 then
+      -- On Gen 3 the tile-level pin is a PLACEHOLDER and nothing more.  It has
+      -- to be non-nil, because `TileShape.at` bails on a nil pin and an
+      -- unmeshed cell is a hole in the world -- but every real answer comes
+      -- from the cell (behaviour byte, collision bit, layer type, elevation),
+      -- so defaulting to `wall` the way Gen 2 does would stand the whole map
+      -- up for the one frame before the cell rule ran, and stand every cell
+      -- the cell rule cannot reach up for good.
+      shapes[t] = shapes.classes.ground
     else
       shapes[t] = shapes.classes.wall
     end
   end
   shapes.count = count
+  shapes.gen3 = gen3 or nil
+  shapes.isGen3 = isGen3 or nil
   cache[id] = shapes
   return shapes
 end
@@ -712,7 +885,7 @@ end
 -- The shape of the tile at TILE coordinates (tx, ty) -- the full
 -- resolution including the cell-granularity steps (see the header).
 -- `shapes` is the table forMap returned for this map; `tile` is
--- map:tileAt(tx, ty), passed in because every caller already has it.
+-- the tile id at (tx, ty), passed in because every caller already has it.
 function TileShape.at(map, shapes, tile, tx, ty)
   -- A PLAYER'S OWN OVERRIDE OUTRANKS EVERYTHING, including the authored
   -- conditional pins below. Those are this mod's opinion about what a drawing
@@ -814,6 +987,63 @@ function TileShape.at(map, shapes, tile, tx, ty)
     if base then return base end
   end
 
+  -- ------------------------------------------------------------------ GEN 3
+  --
+  -- Emerald answers, per cell, every question the rules below this line exist
+  -- to guess at, so it answers here -- above them, and below the player's own
+  -- overrides and the editor's pins, which outrank the cartridge on purpose.
+  --
+  -- Note what is NOT consulted: the tile id.  On Gen 3 a synthetic tile id is
+  -- just "quadrant q of metatile m" and carries no meaning of its own; the
+  -- meaning is entirely the cell's.  All four tiles of a cell therefore
+  -- resolve alike, which is the same thing the Gen 1/Gen 2 cell rules
+  -- accomplish further down and the reason flowers and grass tufts stay flat
+  -- there.
+  -- THE CONTEXT IS PER MAP, THE SHAPE TABLE IS PER TILESET.
+  --
+  -- `forMap` caches by `tileset.id`, which is right for everything it holds --
+  -- the id space, the class heights, the authored pins -- and wrong for the
+  -- one thing that is a property of the MAP: its blockdata. Brendan's house
+  -- shares one tileset across both its floors and its neighbour's, so
+  -- `shapes.gen3` handed 2F the ground floor's cells and every upstairs cell
+  -- resolved to whatever stood at those coordinates downstairs -- the bed came
+  -- out as carpet and the television as a kitchen cabinet.
+  --
+  -- `Gen3.forMap` is itself memoised per map (weakly), so asking it here is a
+  -- table lookup rather than a rebuild.
+  local g3 = shapes.isGen3 and Gen3.forMap(map) or nil
+  if not g3 and shapes.isGen3 then
+    -- A Gen 3 map whose context could not be built.  The rules below this
+    -- point are Gen 1/Gen 2 inferences over a tile id that, here, means
+    -- "quadrant q of metatile m" and carries no meaning at all -- so they
+    -- would not degrade, they would invent.  Answer from the one thing that
+    -- is still true, the cell's own passability, and let the log say why the
+    -- world looks plain (Gen3.forMap has already warned once).
+    local cx0, cy0 = math.floor(tx / 2), math.floor(ty / 2)
+    local walk = false
+    local okW, w = pcall(map.isWalkableCell, map, cx0, cy0)
+    if okW then walk = w and true or false end
+    return walk and shapes.classes.ground or shapes.classes.wall
+  end
+  if g3 then
+    local cx3, cy3 = math.floor(tx / 2), math.floor(ty / 2)
+    local class, pinned = g3.classAt(cx3, cy3)
+    if class then
+      local canon = shapes.classes and shapes.classes[class]
+      local h = canon and canon.h or 0
+      -- The ground the cell stands ON is added for everything that lies flat
+      -- or rides a top face; a piece of COVER keeps its own bare height,
+      -- because `Structures.buildVolume` measures the run and reads the datum
+      -- off the flat cell south of it -- adding the elevation here as well
+      -- would count the terrace twice and float every building above it.
+      local art = ART[class] or "upright"
+      if art ~= "upright" then
+        h = h + g3.groundHeight(cx3, cy3)
+      end
+      return gen3Shape(class, h, pinned)
+    end
+  end
+
   local s = shapes[tile]
   -- conditional pins first: they are authored answers that need the
   -- POSITION to resolve, so they outrank both the flat pin on the same
@@ -829,7 +1059,7 @@ function TileShape.at(map, shapes, tile, tx, ty)
         hit = map:isWalkableCell(math.floor(tx / 2), math.floor(ty / 2))
               == rule.walkable
       else
-        local n = map:tileAt(tx, rule.side == "above" and ty - rule.rows
+        local n = Gen3.tileAt(map, tx, rule.side == "above" and ty - rule.rows
                                                        or ty + rule.rows)
         hit = n and rule.set[n]
       end
@@ -908,7 +1138,7 @@ function TileShape.at(map, shapes, tile, tx, ty)
   end)
   for dy = 0, (okOut and outdoor) and 1 or -1 do
     for dx = 0, 1 do
-      local n = shapes[map:tileAt(cx * 2 + dx, cy * 2 + dy)]
+      local n = shapes[Gen3.tileAt(map, cx * 2 + dx, cy * 2 + dy)]
       if n and n.authored and THIN[n.class] then
         return shapes.classes.ground
       end

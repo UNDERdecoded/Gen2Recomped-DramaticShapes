@@ -471,6 +471,22 @@ end
 -- way either way.
 Voxel3D.camera = nil
 
+-- THE FLOOR THE VIEW IS CENTRED ON.
+--
+-- The orbit used to look at Y = 0 -- the world datum -- whatever the player
+-- was standing on.  Walk up a flight of Sootopolis' steps and the terrace
+-- rose under you while the camera stayed pointed at the water level, so the
+-- player slid up the screen and the frame filled with the ground behind
+-- them.  In the flat view the camera follows the player exactly; in 3D it
+-- has to follow them in Y as well, or a town with any verticality in it
+-- walks its own subject out of frame.
+--
+-- VoxelScene sets this each frame from the height of the CELL the player is
+-- standing on, not from the sprite: a ledge hop arcs the sprite and the
+-- camera must not arc with it.  Zero everywhere the world is flat, which is
+-- most of Kanto and Johto, so nothing there moves.
+Voxel3D.groundY = 0
+
 -- This frame's camera RAY FAN, set by viewProjection alongside vp: the
 -- world direction a canvas point looks along (see Sky.paint's `ray`).
 -- Present for every free-pitch camera -- the VR eyes bring theirs
@@ -595,8 +611,11 @@ function Voxel3D.viewProjection(cx, cy, vw, vh)
   local fov = 2 * math.atan(1 / (2 * focal))
   Voxel3D.fovY = fov
 
-  local focus = { cx, 0, cy }
-  local eye = { cx, dist * math.cos(a), cy + dist * math.sin(a) }
+  -- ...lifted onto the floor the player is standing on, eye and focus
+  -- together, so the framing is identical and only its datum moves.
+  local gy = Voxel3D.groundY or 0
+  local focus = { cx, gy, cy }
+  local eye = { cx, gy + dist * math.cos(a), cy + dist * math.sin(a) }
   -- exposed for camera-facing billboards (VoxelScene yaws sprites at it)
   Voxel3D.eye = eye
   Voxel3D.focus = focus
@@ -1274,10 +1293,18 @@ end
 -- every vertex asks about the exact surface the sun recorded rather than
 -- one a few pixels behind it, and a figure cannot fringe itself. On the
 -- caster itself it is a no-op -- that quad is already flat.
-function Voxel3D.casterMatrix(px, py, y, mirror)
-  local m = Mat4.translate(px + 8, y, py + 8)
+-- `half` is the CARD's half-width and `anchor` the middle of the footprint it
+-- stands on -- the pair VoxelScene.billboardMatrix leans, so that the record
+-- the sun files and the transform a lit card reads its own shadowing with
+-- describe the same rectangle. Both default to 8, which is the 16px walker
+-- this was written for and is what every caller that passes neither still
+-- gets, to the arithmetic operation.
+function Voxel3D.casterMatrix(px, py, y, mirror, half, anchor)
+  half = half or 8
+  anchor = anchor or half
+  local m = Mat4.translate(px + anchor, y, py + anchor)
   if mirror then m = Mat4.mul(m, Mat4.scale(-1, 1, 1)) end
-  return Mat4.mul(Mat4.mul(m, Mat4.translate(-8, 0, 0)),
+  return Mat4.mul(Mat4.mul(m, Mat4.translate(-half, 0, 0)),
                   Mat4.scale(1, 1, 0))
 end
 
@@ -1289,8 +1316,9 @@ end
 -- Flattening is measured from the ground plane, so a hop slides the whole
 -- shadow along the sun line while it stays glued to the ground -- the
 -- classic jump-shadow tell.
-function Voxel3D.shadowMatrix(px, py, gh, lift, mirror)
-  local card = Voxel3D.casterMatrix(px, py, gh + (lift or 0), mirror)
+function Voxel3D.shadowMatrix(px, py, gh, lift, mirror, half, anchor)
+  local card = Voxel3D.casterMatrix(px, py, gh + (lift or 0), mirror,
+                                    half, anchor)
   -- flatten about the ground plane: y' = 0, x/z shear by height above it
   local squash = { 1, Voxel3D.SHADOW_KX, 0, 0,
                    0, 0,                 0, 0,

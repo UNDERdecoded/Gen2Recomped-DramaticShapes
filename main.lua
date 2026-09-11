@@ -45,6 +45,26 @@ local mod = ...
 -- passed in as its vararg (`local V = ...`).
 
 local V = { mod = mod, path = mod.path }
+-- ...and the loader's record carries a handle back, so a TEST DRIVER can
+-- reach the modules this mod actually loaded.
+--
+-- `modules` below is a local closed over by `V.require`, and a plain
+-- `require("mods.DRAMATIC_SHAPE.lib.X")` cannot reach it -- a mod directory
+-- is not on package.path, and the file's `local V = ...` would be handed a
+-- module NAME rather than this namespace and raise on the first `V.require`.
+-- That is not academic: `tests/drivers/g3_shots.lua` guarded its DAYTIME pin
+-- in a pcall, the require raised inside it, and from the day the driver was
+-- written until g3-mass-229 SHOT_DAY silently did nothing -- every QA
+-- screenshot in NOTES.md was lit by the container's wall clock, and two
+-- frames of identical geometry three hours apart differed by half the
+-- brightness.  One field, read-only by convention, and a driver can pin the
+-- light.
+mod.V = V
+-- ...and one global, because the record above is not always the one the
+-- loader keeps in `loader.loaded` (it hands the entry chunk its own table),
+-- so a driver walking the loader finds no namespace at all.  This is a test
+-- seam and nothing in lib/ reads it.
+_G.__DRAMATIC_SHAPE_V = V
 
 local function chunkFor(rel)
   local source = mod:read(rel)
@@ -58,11 +78,96 @@ local function chunkFor(rel)
   return chunk
 end
 
+-- ---------------------------------------------------------------------------
+-- COMPANION MODULES: present is a bonus, absent is not an error.
+--
+-- Other mods extend this one by SPLICING requires into its files -- a ceiling
+-- for first person, flora, a painted backdrop, a sky layer, a jump. That is a
+-- fine way to extend a mod right up until the companion goes away, and then it
+-- is a disaster: `V.require` raised, `main.lua` never finished, and the whole
+-- of DRAMATIC_SHAPE failed to load with
+--
+--     FAILED: DRAMATIC SHAPE: lib/Ceiling.lua is missing -- reinstall the mod
+--
+-- ...over a feature nobody asked for and that had uninstalled ITSELF. The
+-- companion had spliced requires into main.lua, VoxelScene, ChunkMesher,
+-- Structures and FirstPerson, then removed its own payloads and restored only
+-- the files it had backups for -- leaving the splices behind, pointing at
+-- files it had just deleted.
+--
+-- So a companion's module is OPTIONAL by name. Missing, or broken, and the
+-- name resolves to an inert table whose every field is a no-op function: the
+-- spliced `Ceiling.draw(state)` call sites keep working and draw nothing, and
+-- this mod loads. Anything NOT on this list still raises, because a missing
+-- lib/ of our own is a real packaging fault and must be loud.
+--
+-- This is compatibility in one direction only, deliberately. Nothing here
+-- requires the companion, references it, or degrades without it.
+local COMPANION = {
+  Ceiling = true, Flora = true, Backdrop = true, SkyLayer = true, Jump = true,
+}
+
+local function inertModule()
+  -- every field is a function that does nothing and answers nothing, so both
+  -- `M.draw(x)` and `M.thing` are safe on a module that is not there
+  return setmetatable({}, { __index = function() return function() end end })
+end
+
+local companionSaid = {}
+local function companionMissing(name, why)
+  if companionSaid[name] then return end
+  companionSaid[name] = true
+  pcall(function()
+    require("src.core.Logger").info(
+      "DRAMATIC_SHAPE: companion module %s is %s -- carrying on without it",
+      name, why)
+  end)
+end
+
 local modules = {}
 function V.require(name)
   local hit = modules[name]
   if hit ~= nil then return hit end
-  local value = chunkFor("lib/" .. name .. ".lua")(V)
+  local rel = "lib/" .. name .. ".lua"
+  if COMPANION[name] then
+    local source = mod:read(rel)
+    if not source then
+      companionMissing(name, "absent")
+      modules[name] = inertModule()
+      return modules[name]
+    end
+    local chunk, err = load(source, "@" .. mod.path .. "/" .. rel)
+    if not chunk then
+      companionMissing(name, "not compilable: " .. tostring(err))
+      modules[name] = inertModule()
+      return modules[name]
+    end
+    local ok, value = pcall(chunk, V)
+    if not (ok and value ~= nil) then
+      companionMissing(name, "failed to load: " .. tostring(value))
+      modules[name] = inertModule()
+      return modules[name]
+    end
+    modules[name] = value
+    return value
+  end
+  local value = chunkFor(rel)(V)
+  modules[name] = value
+  return value
+end
+
+-- The explicit form, for anything of ours that is genuinely optional: nil when
+-- it is not there, never an error, never a stub.
+function V.optional(name)
+  local hit = modules[name]
+  if hit ~= nil then return hit end
+  local rel = "lib/" .. name .. ".lua"
+  local source = mod:read(rel)
+  if not source then return nil end
+  local chunk = load(source, "@" .. mod.path .. "/" .. rel)
+  if not chunk then return nil end
+  local ok, value = pcall(chunk, V)
+  if not (ok and value ~= nil) then return nil end
   modules[name] = value
   return value
 end
@@ -282,7 +387,15 @@ mod.content.render_pipelines:register("voxel", {
       -- else -- so the scale goes up with it, or the "!" bubble lands the
       -- right place at half the size.  project() already answers in canvas
       -- pixels, so only the scale needs saying.
-      ctx.drawFx(function(wx, wy) return Voxel3D.project(wx, 0, wy) end,
+      -- ...at the floor the camera is centred on, not at the world
+      -- datum.  The FX these closures draw belong to the player and to
+      -- what is under their feet -- the "!" bubble, a grass rustle, a
+      -- puff of sand -- so on a terrace they anchor to the terrace.
+      -- Projecting them at zero left them sunk into the deck the player
+      -- was standing on, by exactly the height of the climb.
+      ctx.drawFx(function(wx, wy)
+                   return Voxel3D.project(wx, Voxel3D.groundY or 0, wy)
+                 end,
                  ctx.scale * AntiAlias.factor())
       -- the horde's readout rides the same overlay, over the FX: health,
       -- ammunition, the crosshair and the banners, sized in the same

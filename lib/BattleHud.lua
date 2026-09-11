@@ -327,9 +327,18 @@ end
 -- Run `fn` with its ink whitened. Falls back to running it plainly when the
 -- scratch layer or the shader is unavailable, so a driver that cannot do
 -- either gets the vanilla black HUD rather than no HUD.
+-- `w, h` are THE SURFACE THE CALLER IS DRAWING INTO, not the Game Boy's
+-- screen. A layer smaller than that silently clips whatever `fn` draws past
+-- its edge -- which is how Emerald's 240x160 message strip lost its right 80
+-- columns and its bottom 16 rows to a 160x144 scratch canvas, and how the
+-- player's status block lost 68% of itself. Callers get it from
+-- BattleScene.surface(); this only has to trust it and reallocate on change.
 function BattleHud.flipGlyphs(w, h, fn)
   local sh = getFlip()
   if not sh then return fn() end
+  if not (type(w) == "number" and type(h) == "number" and w > 0 and h > 0) then
+    return fn()
+  end
   if not layer or layer:getWidth() ~= w or layer:getHeight() ~= h then
     layer = canvasOf(w, h, "nearest")
     if not layer then return fn() end
@@ -405,7 +414,11 @@ local function getBrightBarShader()
   return brightBarShader or nil
 end
 
+-- `w, h` are THE SURFACE the HUD is drawn in -- see the note on flipGlyphs.
 function BattleHud.layerTexture(w, h, dark, fn)
+  if not (type(w) == "number" and type(h) == "number" and w > 0 and h > 0) then
+    return nil
+  end
   if not hudLayer or hudLayer:getWidth() ~= w or hudLayer:getHeight() ~= h then
     hudLayer = canvasOf(w, h, "nearest")
     if not hudLayer then return nil end

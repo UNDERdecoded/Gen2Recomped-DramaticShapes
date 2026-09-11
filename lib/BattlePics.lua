@@ -183,6 +183,71 @@ local function inkBounds(data, w, h)
   return x0, y0, x1, y1
 end
 
+-- ------- where a mon's FEET are inside its own buffer
+--
+-- WHAT ROW OF THE PIC IS THE GROUND LINE.  Not the bottom of the image: the
+-- bottom of the INK, which on Hoenn art is a long way above it.
+--
+-- A Gen 3 front pic is a 64x64 frame with the artwork placed inside it, and
+-- the cartridge keeps the alignment in a SEPARATE table -- the y_offset of
+-- gMonFrontPicCoords -- which this port extracts (`picCoords` on the species
+-- row) and nothing reads.  Nothing needs to while a pic is composited over a
+-- flat field: the empty rows under the mon are white on white and the eye
+-- never learns they are there.
+--
+-- Stand the same frame UP ON THE MAP and those rows become daylight -- under
+-- the FOE alone.  The engine already measures this number for every pic it
+-- decodes (BattleState.getImage's ground padding, imagePadBottom) and
+-- backPlacement subtracts it, which is why the player's mon has always stood
+-- correctly; frontPlacement has no such argument, so the foe's card is hung
+-- from the image's BOTTOM EDGE and a mon with fourteen empty rows below it
+-- stands fourteen canvas rows clear of the ground.
+--
+-- Measured over all 379 of Emerald's 64x64 front pics: 344 of them have at
+-- least one empty row under the artwork, the median is 8 and the worst are
+-- Luvdisc and Wingull at 24.  At the card's scale (BattleBillboard.FULL_W /
+-- FULL_PIC) one empty row is 0.29 world pixels, and from the battle camera
+-- one world pixel at the enemy's cell is about 3.7 GB pixels of lift -- so a
+-- row of empty frame is very nearly a GB pixel of float, and Luvdisc floats
+-- 26 of them: its feet land on row 30 of a screen whose enemy anchor is row
+-- 56, with its head off the top edge.  That is the "the enemy is floating and
+-- off the screen unless I zoom out" report, and both halves of it are this
+-- one number.
+--
+-- A pic with no empty rows answers 0 and nothing moves -- 35 of Hoenn's own
+-- fronts, and Gen 1 and Gen 2 art, which the decoder hands over already cut
+-- to the mon's own tile box.  Where a Kanto or Johto front pic does carry a
+-- row or two, this puts it on the floor beside its player's mon, which is
+-- where backPlacement has always put that one; the correction is bounded by
+-- the empty frame the pic actually has and can only ever move a card DOWN,
+-- never past the ground.
+--
+-- Read off the GPU and cached per image, exactly like the paper fill above
+-- and for the same reason: what comes back is the pic the engine actually
+-- decided to draw, whatever produced it.
+local footCache = setmetatable({}, { __mode = "k" })
+
+function BattlePics.footPad(img)
+  if not img then return 0 end
+  local hit = footCache[img]
+  if hit ~= nil then return hit end
+  local pad = 0
+  local ok = pcall(function()
+    local w, h = img:getDimensions()
+    if not (w and h and w > 0 and h > 0) then return end
+    local data = readBack(img)
+    if not data then return end
+    local _, _, _, y1 = inkBounds(data, w, h)
+    -- a pic with no ink at all (a placeholder, a mon mid-fade) keeps the
+    -- buffer's own bottom: there is no baseline to find and inventing one
+    -- would move a card for a frame and move it back
+    if y1 and y1 >= 0 then pad = (h - 1) - y1 end
+  end)
+  if not ok then pad = 0 end
+  footCache[img] = pad
+  return pad
+end
+
 -- The colour the keyed-away shade would have had: the LIGHTEST colour still
 -- standing in the pic.
 --
@@ -342,6 +407,7 @@ end
 
 function BattlePics.invalidate()
   cache = newCache()
+  footCache = setmetatable({}, { __mode = "k" })
 end
 
 return BattlePics

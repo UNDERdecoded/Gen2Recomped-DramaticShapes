@@ -78,13 +78,53 @@ local INDOOR_SHADE = 4
 -- blits the 160x144 UI canvas into a centred, integer-scaled letterbox. So
 -- these have to agree with Renderer:endFrame exactly, or the pins land off
 -- the mons by however much they disagree.
+-- ------- THE SURFACE THE BATTLE IS ACTUALLY LAID OUT IN
+--
+-- GB_W x GB_H is the Game Boy's screen and it used to be the only answer.  It
+-- is not any more: a Gen 3 cache fights on Emerald's own 240x160 surface
+-- (src/battle/Gen3Battle.lua), which BattleState:uiSize asks the renderer for
+-- and Renderer:endFrame then composites -- letterbox origin
+-- floor((p - ui*S)/2) -- in the surface's OWN dimensions.
+--
+-- Computing that origin from 160x144 while the renderer computes it from
+-- 240x160 is the whole of the reported bug.  At 1024x768 the two answers are
+-- (192,96) and (32,64): every frosted panel, every snapped HUD band and the
+-- text box's glass were placed 160 px right and 32 px down from the thing
+-- they were supposed to be under, and the widening in letterboxFov was 1.333
+-- instead of 1.200 -- an 11% too-wide lens on top of it.
+--
+-- So the frame is ASKED FOR rather than assumed, and it is asked of
+-- Renderer:uiSize -- the same field endFrame reads -- so the two cannot
+-- disagree by construction.  On Gen 1, Gen 2 and Prism uiSize answers
+-- 160x144, which is GB_W x GB_H, so every number below is bit-identical.
+--
+-- NOT a rename of GB_W / GB_H.  Those still mean the Game Boy's frame and
+-- there are two places that genuinely want exactly that and must not follow
+-- the surface: the billboard TEXTURE canvas (OverworldBattle.texCanvasFor is
+-- 160x144 with the pic forced to TEX_AX/TEX_AY, and monMatrix below divides
+-- by those same dimensions to hang the card), and the move-animation layer,
+-- whose OAM frames are authored in the original 160-pixel space whatever
+-- surface they are finally shifted into.
+function BattleScene.surface()
+  local Renderer = require("src.render.Renderer")
+  if Renderer and Renderer.uiSize then
+    local ok, w, h = pcall(Renderer.uiSize, Renderer)
+    if ok and type(w) == "number" and type(h) == "number"
+       and w > 0 and h > 0 then
+      return math.floor(w), math.floor(h)
+    end
+  end
+  return BattleScene.GB_W, BattleScene.GB_H
+end
+
 function BattleScene.letterbox()
   local Renderer = require("src.render.Renderer")
   local pw, ph = BattleScene.pixelSize()
   local s = Renderer:fitScale()
-  return math.floor((pw - BattleScene.GB_W * s) / 2),
-         math.floor((ph - BattleScene.GB_H * s) / 2),
-         s, pw, ph
+  local sw, sh = BattleScene.surface()
+  return math.floor((pw - sw * s) / 2),
+         math.floor((ph - sh * s) / 2),
+         s, pw, ph, sw, sh
 end
 
 -- The window in FRAMEBUFFER pixels, which is what the override blit works
@@ -106,7 +146,9 @@ end
 -- works back out to the GB frame's own 160/144. So one scale on the vertical
 -- pins both axes.
 function BattleScene.letterboxFov(fovGB, ph, s)
-  local span = BattleScene.GB_H * s
+  -- the letterbox's height in framebuffer pixels, which is the SURFACE's
+  -- rows at the fit scale -- 144 on a Game Boy screen, 160 on Emerald's
+  local span = select(2, BattleScene.surface()) * s
   if span <= 0 then return fovGB end
   return 2 * math.atan(math.tan(fovGB / 2) * ph / span)
 end
@@ -132,17 +174,26 @@ end
 -- battle changes -- the fight, the party, the player's own position are all
 -- exactly where they were.
 --
--- A foreign floor is meshed alone, with no connected neighbours: connections
+-- A foreign floor is DRAWN alone, with no connected neighbours: connections
 -- are the player's neighbourhood, and the map the camera has gone to visit is
 -- not standing in it. Both maps are kept live so neither the arena's mesh nor
 -- the one waiting to be walked back onto is evicted mid-battle.
+--
+-- It is still meshed with its own masks, though. There is one full mesh per
+-- map and it is cached under the map id: built here with none, it would be
+-- the copy the renderer finds when that floor is next walked onto or drawn
+-- beside its neighbour, and its border ring would stand over their ground.
+-- `VoxelScene.masksFor` is the same answer everywhere, which is the point of
+-- it -- and on the cave and building floors an authored arena names, the
+-- map states no connections and the answer is the empty list this passed
+-- before.
 local function prefetchArena(state, host)
   if host == state.map then return VoxelScene.prefetch(state) end
   local live = { [host.id] = true, [state.map.id] = true }
   for _, nb in ipairs(state.neighbors or {}) do live[nb.map.id] = true end
   ChunkMesher.setLive(live)
   TerrainAtlas.setLive(live)
-  ChunkMesher.request(host, false, nil, true)
+  ChunkMesher.request(host, false, VoxelScene.masksFor(host, state), true)
   local terrain, water = ChunkMesher.pair(host, false)
   if not terrain then terrain, water = ChunkMesher.pair(host, true) end
   return terrain, {}, water, {}
@@ -178,12 +229,38 @@ end
 -- one is a BACK view -- the player seen from behind, already turned to face
 -- up the field -- so it arrives pointing the right way and mirroring it would
 -- turn it around to face the camera it is standing in front of.
+-- ------- THE CARD IS HUNG FROM THE TEXTURE'S OWN DIMENSIONS
+--
+-- These four lines used to read GB_W and GB_H, which are the GAME BOY'S
+-- SCREEN, while the thing they describe is the BILLBOARD CANVAS
+-- (OverworldBattle.texCanvasFor). The two were the same number, and that is
+-- the same coincidence g3-viewport-254 was: a size stated in one place and
+-- assumed in another, correct only for as long as nobody changes either.
+--
+-- WHY THIS IS EXACTLY NEUTRAL, and why the mon cannot grow when the canvas
+-- does. Work out where a canvas pixel (u, v) lands on the card:
+--
+--     right = ox + (u/CW - 0.5) * CW*k  =  (u - ax) * k
+--     up    = oy + ((CH - v)/CH) * CH*k =  (ay - v) * k
+--
+-- Neither CW nor CH survives. A canvas pixel is k world pixels wherever it
+-- is and whatever size the canvas is; what a bigger canvas buys is more
+-- TRANSPARENT MARGIN around the pic, not a bigger pic. So the apparent size
+-- of the artwork on screen is a function of the pic's own pixel count and
+-- nothing else -- which is the property that lets the canvas follow the
+-- layout's surface without the Pokemon changing size.
+--
+-- `tex.cw` / `tex.ch` are the canvas the pic was actually rendered into (see
+-- OverworldBattle.sideTexture); the fallback is the Game Boy frame, which is
+-- what every existing caller was assuming.
 local function monMatrix(tex, x, groundY, z, mirror)
   local k = BattleBillboard.FULL_W / BattleBillboard.FULL_PIC
-  local w = BattleScene.GB_W * k
-  local h = BattleScene.GB_H * k
-  local ox = -((tex.ax / BattleScene.GB_W) - 0.5) * w
-  local oy = -((BattleScene.GB_H - tex.ay) / BattleScene.GB_H) * h
+  local CW = tex.cw or BattleScene.GB_W
+  local CH = tex.ch or BattleScene.GB_H
+  local w = CW * k
+  local h = CH * k
+  local ox = -((tex.ax / CW) - 0.5) * w
+  local oy = -((CH - tex.ay) / CH) * h
   local yaw = BattleBillboard.yawToward(x, z, Voxel3D.eye)
   local card = Mat4.mul(Mat4.translate(ox, oy, 0), Mat4.scale(w, h, 1))
   if mirror then card = Mat4.mul(Mat4.scale(-1, 1, 1), card) end
@@ -297,11 +374,33 @@ end
 
 -- The sun has to see the mons too, or they stand on the ground without
 -- putting anything on it. They are the one thing in this scene that MOVES,
--- so `token` -- a counter the caller bumps whenever a pic could have changed
--- -- goes in the signature; the terrain half of the answer would otherwise
+-- so they go in the signature; the terrain half of the answer would otherwise
 -- keep a stale pass alive and freeze the shadows in whatever pose they were
 -- first drawn in.
-local function shadowSignature(state, arena, terrain, nbMesh, token)
+--
+-- THE POSE, NOT THE FRAME NUMBER.  `token` used to be a counter the caller
+-- bumped once per frame, which is not "whenever a pic could have changed" but
+-- "always": no two frames of a battle ever shared a signature, so the sun
+-- pass never once hit its own cache and the whole arena -- the terrain mesh,
+-- every connected neighbour, the water, the flowers -- was redrawn from the
+-- light sixty times a second for two cards that were standing still. It is
+-- the one thing this pass does that the free-roam pass does not (compare
+-- VoxelScene.shadowSignature, which lists the poses and skips the sun
+-- entirely while nobody moves), and it was the single biggest thing in a
+-- battle frame -- bigger than the main pass that draws the picture.  Measured
+-- over 90 frames of one fight in Oldale Town, on the same arena, back to back
+-- on the same machine: 90 sun passes costing 210.6 ms a frame of a 462.9 ms
+-- frame, against 7 passes costing 12.7 ms a frame of a 230.9 ms one -- the
+-- main pass unchanged at 198 and 194.  (Software renderer under xvfb, so the
+-- absolute numbers are inflated; the ratio and the CALL COUNT are the point.)
+--
+-- `token` is now a stamp of what the two pics layers actually DREW
+-- (OverworldBattle.sideTexture), and the cards' own model matrices go in
+-- beside it -- quantised to a sixteenth of a world pixel -- so steering the
+-- orbit, which yaws both cards toward the new seat, re-casts them and the
+-- drift's two degrees over twenty-six seconds re-casts them a few times a
+-- swing rather than sixty times a second.
+local function shadowSignature(state, arena, terrain, nbMesh, token, cards)
   local host = arena.map or state.map
   local parts = { "battle", host.id, arena.x, arena.y, arena.shape,
                   tostring(terrain), tostring(token or 0),
@@ -310,6 +409,12 @@ local function shadowSignature(state, arena, terrain, nbMesh, token)
                   math.floor(ShadowMap.KX * 128),
                   math.floor(ShadowMap.KZ * 128) }
   for i = 1, #nbMesh do parts[#parts + 1] = tostring(nbMesh[i]) end
+  for _, card in ipairs(cards or {}) do
+    local m = card.model
+    -- the 3x4 that carries the rotation and the translation; the last row is
+    -- (0,0,0,1) on every card this pass ever sees
+    for i = 1, 12 do parts[#parts + 1] = math.floor((m[i] or 0) * 16) end
+  end
   return table.concat(parts, ",")
 end
 
@@ -317,7 +422,7 @@ local function castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh,
                            atlasFor, cards, token, host, neighbors,
                            water, nbWater)
   if not ShadowMap.available() then return end
-  local sig = shadowSignature(state, arena, terrain, nbMesh, token)
+  local sig = shadowSignature(state, arena, terrain, nbMesh, token, cards)
   if not ShadowMap.stale(sig) then return end
   if not ShadowMap.begin(cx, cy, vw, vh) then return end
 
@@ -475,7 +580,7 @@ function BattleScene.render(state, arena, textures, token)
   -- the player's zoom is part of this: the sun's box is fitted to what the
   -- frame holds, so a shot pulled wide has to light the ground it just
   -- brought into view rather than the ground the rig alone would have
-  local vh = BattleCam.frameH(arena) * ph / (BattleScene.GB_H * s)
+  local vh = BattleCam.frameH(arena) * ph / (select(2, BattleScene.surface()) * s)
   local vw = vh * pw / ph
 
   -- the cards need the camera's eye to face it, so the rig has to be live

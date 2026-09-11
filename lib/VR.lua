@@ -253,11 +253,14 @@ local function dexScreen()
     end
     if not (fbo and VRGL.copyFrontToCanvas(fbo, ww, wh)) then return nil end
     local BattleScene = V.require("BattleScene")
-    local lx, ly, s = BattleScene.letterbox()
+    -- the letterbox's own size, not the Game Boy's: on Emerald's 240x160
+    -- surface those are different rectangles and cropping to the smaller
+    -- one cut the right-hand third of the screen off the device in the hand
+    local lx, ly, s, _, _, sw, sh = BattleScene.letterbox()
     return { dexCanvas,
              lx / ww, ly / wh,
-             (lx + BattleScene.GB_W * s) / ww,
-             (ly + BattleScene.GB_H * s) / wh }
+             (lx + sw * s) / ww,
+             (ly + sh * s) / wh }
   end)
   return ok and out or nil
 end
@@ -474,9 +477,9 @@ local function updateQuad(worldUp, fp)
   local copied = false
   pcall(function()
     local BattleScene = V.require("BattleScene")
-    local lx, ly, s = BattleScene.letterbox()
-    local wpx = math.ceil(BattleScene.GB_W * s)
-    local hpx = math.ceil(BattleScene.GB_H * s)
+    local lx, ly, s, _, _, sw, sh = BattleScene.letterbox()
+    local wpx = math.ceil(sw * s)
+    local hpx = math.ceil(sh * s)
     local sx = math.max(0, math.floor(lx))
     local sy = math.max(0, math.floor(wh - ly - hpx))
     wpx = math.min(wpx, ww - sx)

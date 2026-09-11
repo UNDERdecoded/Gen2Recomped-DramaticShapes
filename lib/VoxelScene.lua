@@ -23,6 +23,7 @@ local TerrainAtlas = V.require("TerrainAtlas")
 local Voxel = V.require("VoxelState")
 local Sky = V.require("Sky")
 local Water = V.require("Water")
+local Gen3 = V.require("Gen3")
 local VoxelGrid = V.require("VoxelGrid")
 local DayNight = V.require("DayNight")
 local FirstPerson = V.require("FirstPerson")
@@ -150,6 +151,13 @@ end
 local function skyFor(map)
   local sky = VoxelScene.skyColor(map, skyStrength(Voxel.angle))
   if not sky then return nil end
+  -- DIAGNOSTIC ONLY -- see HOENN_RELIEF/tools/sky_holes.py.  Emerald's water
+  -- renders the sky's own colour, so a hole and a pond are the same pixel and
+  -- no screen-reading metric can tell them apart.  Painted flat magenta this
+  -- shot answers the question outright.  Never shipped.
+  if os.getenv("POKEPORT_SKY_FLAT") then
+    return { 1, 0, 1, 1 }
+  end
   return Sky.dress(sky)
 end
 
@@ -169,7 +177,12 @@ local YAW = {
 -- The ground height a cell stands at, so a character on a ledge stands on
 -- top of it rather than sunk into it. Uses the same bottom-left collision
 -- tile the engine walks on (Map:cellTile).
-local function groundAt(map, cellX, cellY)
+-- `px`/`py` are the entity's WORLD PIXEL position, when the caller has one.
+-- They are what makes a flight climb continuously instead of in cell-sized
+-- jerks: without them a stair cell can only answer one height for the whole
+-- cell, and the walker pops.  Optional, because plenty of callers ask about a
+-- cell with nobody standing in it.
+local function groundAt(map, cellX, cellY, elev, px, py)
   -- Off the map, cellTile border-extends into the map's borderBlock --
   -- which on maps ringed with trees is a RAISED tile. The only entity
   -- ever standing off-map is the player mid seam-step (placed one cell
@@ -184,25 +197,303 @@ local function groundAt(map, cellX, cellY)
   -- so indexing the tile shapes with it read some unrelated tile's box and
   -- stood every character 16px above the ground they were walking on
   local tx, ty = cellX * 2, cellY * 2 + 1
-  local s = TileShape.at(map, shapes, map:tileAt(tx, ty), tx, ty)
+  local s = TileShape.at(map, shapes, Gen3.tileAt(map, tx, ty), tx, ty)
   if not s then return 0 end
   -- a box the walker passes THROUGH rather than onto: Gen 2 pins its
   -- doorways solid so the facade closes over them, and the cell they are
   -- cut into stays walkable
-  if s.art == "upright" and map:isWalkableCell(cellX, cellY) then return 0 end
+  if s.art == "upright" and map:isWalkableCell(cellX, cellY) then
+    -- ...but at the height that box STANDS ON, not at the world datum.
+    -- A Sootopolis doorway is cut into a facade founded four courses up,
+    -- and answering 0 here walked the player out of the house and into
+    -- the inside of the terrace below it.
+    return Structures.standHeight(map, tx, ty) or 0
+  end
   -- a recessed class (water) still supports whatever stands on it; only
   -- raised ground lifts the model.  Stairs never do: the class height is
   -- the flight's TALL end, but the player enters at floor level and the
   -- warp fires as they step in -- lifting them onto the geometry read as
   -- climbing an invisible block
-  if s.art == "stair" then return 0 end
+  -- `s` is the TILE's own shape, and Gen 3 has no stair art in the tileset:
+  -- its flights are found by Structures, from tread art and the profile's
+  -- flight lists, and marked on the cell.  Ask there too or the branch below
+  -- can never fire on a Hoenn map.
+  local marked = false
+  if Structures.stairAt then
+    local okS, m2 = pcall(Structures.stairAt, map, tx, ty)
+    marked = (okS and m2) or false
+  end
+  if s.art == "stair" or marked then
+    -- A FLIGHT CLIMBS.
+    --
+    -- This used to answer `standHeight` -- the flight's FOOT -- so walking a
+    -- staircase never raised the walker at all: they slid along the bottom
+    -- terrace with the treads drawn under their feet, arrived at the top and
+    -- popped up a course.  That is the whole of the "stairs don't lead up to
+    -- the next level" report.
+    --
+    -- The flight's two LANDINGS give the gap, through the same ranked
+    -- elevation table the terraces are built from, so the top tread and the
+    -- terrace it serves are equal by construction.  Position along the run
+    -- gives the rest: a multi-cell flight spreads one rise over all its
+    -- cells rather than a course per tile.
+    local z0, z1, axis, heading, idx, n = Structures.flightEnds(map, cellX, cellY)
+    if z0 and z1 and n and n > 0 then
+      local sub = 0.5
+      if px and py then
+        local off = (axis == "x") and (px % 16) or (py % 16)
+        sub = off / 16
+        if sub < 0 then sub = 0 elseif sub > 1 then sub = 1 end
+      end
+      -- WHICH TREAD IS THE BOTTOM ONE -- and the collision had it backwards
+      -- while the MESH had it right, which is why the stairs looked correct
+      -- and walked inverted: "the bottom stair raises me up to the height of
+      -- the highest stair and the highest stair lowers me to the height of
+      -- the lowest".
+      --
+      -- `flightEnds` returns its two landings SORTED -- z0 is the low one --
+      -- but `idx` counts from the run's START, which is the high end whenever
+      -- `heading` is -1.  Flipping only `sub` reverses the ramp WITHIN each
+      -- tread and leaves the tread order alone, so the whole flight ran the
+      -- wrong way round.
+      --
+      -- `ChunkMesher`'s tread pass already states the rule -- "the index from
+      -- the LOW end is one or the other" -- so use the same expression here
+      -- and the two agree by construction instead of by correction.
+      local fromLow = (heading == 1) and idx or (n - 1 - idx)
+      if fromLow < 0 then fromLow = 0 end
+      if heading and heading < 0 then sub = 1 - sub end
+      local t = (fromLow + sub) / n
+      if t < 0 then t = 0 elseif t > 1 then t = 1 end
+      return z0 + (z1 - z0) * t
+    end
+    -- NOTHING TO CLIMB BETWEEN.  A flight with one landing, or two at the
+    -- same level, still stands on a terrace -- and `standHeight` answers the
+    -- LOWEST walkable neighbour, which beside a ring at 48 is the lake.  Ask
+    -- the terrace pass for the foot it gave this run before falling back to
+    -- a reading of the neighbourhood.
+    if Structures.terraceAt then
+      local okT, tz = pcall(Structures.terraceAt, map, cellX, cellY)
+      if okT and type(tz) == "number" then return tz end
+    end
+    return Structures.standHeight(map, tx, ty) or 0
+  end
+  -- THE TERRACE IS THE FLOOR, WHATEVER THE CELL'S ART BECAME.
+  --
+  -- Structures.finishedFloor -- which every height pass in that file is built
+  -- on -- reads S.synthZ FIRST and only then looks at the cell's shape.  This
+  -- function did the opposite, so the two disagreed about the same cell: at
+  -- Mt Chimney (14..16, 37) three walkable cells of one flat corridor all
+  -- carried synthZ 80, and because the volume pass had left a "wall" shape on
+  -- two of them, groundAt answered 32, 0 and 80 along a row you can walk in a
+  -- straight line.  That is the verticality glitch, and it is a disagreement
+  -- between two files rather than a wrong height in either.
+  --
+  -- ...and a cell the mesher gave a MEASURED height to answers with that
+  -- one, not with its class default: the river above a waterfall is drawn
+  -- at the fall's crest (Structures.buildFalls), and a surfer reading the
+  -- class height alone swam four cells under the sheet he was floating on.
+  -- A BRIDGE CELL IS TWO PLACES, and the walker's ELEVATION says which.
+  --
+  -- Emerald's MULTI cells keep the elevation you arrived with -- that is
+  -- the whole mechanism of walking UNDER the cycling road while someone
+  -- rides over your head.  The deck height is right only for the walker
+  -- who is ON the deck; answered to the one underneath it teleported them
+  -- onto the road the moment they stepped into its shadow.  The engine
+  -- tracks the elevation per entity exactly as the cartridge does, so ask
+  -- it: an entity below the bridge's own level stands on the ground the
+  -- bridge spans.
+  -- A DECK IS THE FLOOR ONLY FOR WHOEVER IS ON IT.
+  --
+  -- Keyed on the cartridge's own ELEV_MULTI (15) rather than on the voxel
+  -- class, because the class does not always say bridge.  Victory Road's
+  -- crossings carry no bridge BEHAVIOUR at all -- they are ordinary floor
+  -- metatiles whose only statement of "this is a deck" is elevation 15 --
+  -- so a class test saw thirty perfectly ordinary `ground` cells and lifted
+  -- every walker onto them.  That is the teleport-onto-the-bridge report.
+  --
+  -- THIS QUESTION IS ASKED BEFORE THE TERRACE, AND IT HAS TO BE.
+  --
+  -- MOTIVATED BY FORTREE CITY (30..33, 14), THE ONE SPAN IN HOENN YOU CAN
+  -- WALK UNDER: four cells of MB_FORTREE_BRIDGE at ELEV_MULTI, the rope
+  -- walkway at 32 crossing a street at 0.
+  --
+  -- The terrace short-circuit below was added for Mt Chimney's corridor and
+  -- it answers `S.synthZ` for ANY walkable cell -- including a deck.  Fortree's
+  -- span carries synthZ 32, so every walker there was answered 32 whatever
+  -- elevation they arrived with, and the block underneath -- written for
+  -- exactly this case -- could never run.  The player walking the street was
+  -- lifted onto the planks over their head.
+  --
+  -- ...AND THE SPAN IS WALKED, NOT PEEKED AT.
+  --
+  -- The old search looked at the four touching cells only, and the middle of
+  -- a MULTI span has MULTI on both sides and the ground it crosses on the
+  -- other two: at (31,14) and (32,14) no neighbour is at the walkway's own
+  -- level, so the search failed and the fallback answered the DATUM.  A
+  -- walker on the deck fell 32px through it.  Measured with the map's
+  -- Structures analysis dropped -- which is the state `ChunkMesher.refresh`
+  -- leaves it in while the stale mesh keeps drawing, and g3-tier-224's seam
+  -- refresh now does that mid-session -- FortreeCity y=14, elev 4:
+  --
+  --     x  ..29  30  31  32  33  34..
+  --     h    32  32   0   0  32  32
+  --
+  -- and once `forMap` had rebuilt the cache the terrace answered 32 again.
+  -- That is "the bridge where there is a path to walk under it is making me
+  -- fall through but then after some time will pop me back up".
+  --
+  -- So walk ALONG the deck to find the level the walker is on, and where the
+  -- span states nothing about that level, fall through to the ordinary
+  -- reading -- the deck's own drawn height -- rather than inventing a hole.
+  local okG3, g3ctx = pcall(Gen3.forMap, map)
+  local cellE = nil
+  if okG3 and g3ctx and g3ctx.elevationAt then
+    local okE, e2 = pcall(g3ctx.elevationAt, cellX, cellY)
+    cellE = okE and e2 or nil
+  end
+  local isDeck = (s.class == "bridge" or s.class == "log") or cellE == 15
+  -- a walker whose own elevation IS this cell's is standing ON it, whatever
+  -- the class says: only a walker at a DIFFERENT stated level is underneath
+  if isDeck and elev ~= nil and elev ~= 0 and elev ~= 15 and cellE ~= elev
+     and okG3 and g3ctx and g3ctx.elevationAt and g3ctx.groundHeight then
+    local seen = { [cellY * 8192 + cellX] = true }
+    local queue, qi = { { cellX, cellY } }, 1
+    while qi <= #queue and qi <= 24 do
+      local c = queue[qi]
+      qi = qi + 1
+      for _, d in ipairs({ { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 } }) do
+        local nx, ny = c[1] + d[1], c[2] + d[2]
+        local nk = ny * 8192 + nx
+        if map:inBounds(nx, ny) and not seen[nk] then
+          seen[nk] = true
+          local okE, ne = pcall(g3ctx.elevationAt, nx, ny)
+          ne = okE and ne or nil
+          if ne == elev then
+            -- ...AND THE NEIGHBOUR IS ASKED THE SAME QUESTION, NOT A
+            -- DIFFERENT ONE.
+            --
+            -- `Gen3.groundHeight` is the ELEVATION grid's answer and it is
+            -- not always the finished one: on a `causeway` map it pins all
+            -- land to the datum on purpose and lets the bridge behaviour
+            -- carry the lift, so asking it for Route 110's cycling road
+            -- returns 0 where the road is drawn at 16 -- and a cyclist
+            -- crossing one of that map's 185 MULTI cells fell off the
+            -- flyover.  Shoal Cave's ice bridge reads 16 against a floor
+            -- drawn at 32 for the same reason.
+            --
+            -- The neighbour is a cell at the walker's OWN level, so it can
+            -- never re-enter this branch (`cellE ~= elev` fails there) and
+            -- the recursion is one deep.  Ask it what it stands on and the
+            -- two sides of the span agree by construction.
+            return groundAt(map, nx, ny, elev) or 0
+          end
+          -- keep walking, but only along the span itself
+          if ne == 15 then queue[#queue + 1] = { nx, ny } end
+        end
+      end
+    end
+  end
+
+  -- A walkable cell stands on its terrace.  Ask the terrace.
+  if map:isWalkableCell(cellX, cellY) and Structures.terraceAt then
+    local okT, tz = pcall(Structures.terraceAt, map, cellX, cellY)
+    if okT and type(tz) == "number" then return tz end
+  end
+
+  -- A CELL WHOSE DRAWING STOOD UP IS GROUND AGAIN.  Asked after the doorway
+  -- and stair branches above, which have their own right answers; this is for
+  -- the props -- chimneys, lamps, barrels -- whose art was lifted into a hull
+  -- and whose leftover shape still carries the height that art had.
+  local stamped = Structures.stampGround(map, tx, ty)
+  if stamped then return stamped end
+
   -- ...and a cell the mesher gave a MEASURED height to answers with that
   -- one, not with its class default: the river above a waterfall is drawn
   -- at the fall's crest (Structures.buildFalls), and a surfer reading the
   -- class height alone swam four cells under the sheet he was floating on.
   local measured = Structures.runHeight(map, tx, ty)
   if measured and measured > 0 then return measured end
-  return s.h > 0 and s.h or 0
+  if s.h > 0 then return s.h end
+  -- ...AND THE SEA IS DRAWN BELOW THE DATUM, WHICH THE LINE ABOVE THROWS
+  -- AWAY.
+  --
+  -- MOTIVATED BY THE SEA OFF ROUTE 118, and by the seafloor under it: a
+  -- surfing character floated above the water they are sitting on, and a
+  -- diver walking the seabed floated above that.
+  --
+  -- Hoenn draws its water RECESSED into its own cell -- ChunkMesher's
+  -- SEAM_DATUM comment states the same fact from the other side, "Hoenn
+  -- draws the sea two pixels into its own cell" -- so a water tile's
+  -- height is -2 or -4 and never positive.  Every branch above is silent
+  -- for such a cell: `terraceAt` is nil (the terrace pass votes on LAND,
+  -- and a sea cell is in no terrace), there is no run and no stamp, and
+  -- the `> 0` test rejects the one number that IS the answer.  The cell
+  -- fell through to the neighbour vote and came back with the world datum,
+  -- so the rider sat 2 or 4 pixels above the sheet they are drawn on.
+  --
+  -- Measured over the 81 outdoor maps: 57,375 cells drawn as water on 62
+  -- maps; 43,070 draw their surface at -4 and 6,945 at -2, and on every
+  -- one of those the character stood exactly that far above it.  The other
+  -- 7,292 are already right and are untouched -- their water is drawn AT
+  -- or ABOVE the datum (Route 119's river at 28, Lilycove's harbour and
+  -- Route 120's ponds at 12) and the run two lines above answers them.
+  --
+  -- Gen 3 only.  Gen 1 and Gen 2 draw a recessed water class of their own
+  -- and this is the one function every surfing character in the project
+  -- asks, so the negative half of the answer is taken only where it was
+  -- measured: a Kanto or Johto lake answers exactly what it always did.
+  if s.class == "water" and Gen3.mapIsGen3(map) then return s.h end
+  -- ...AND THE DATUM IS NOT THE DEFAULT FLOOR.
+  --
+  -- A walkable cell with no run and no height of its own still sits on
+  -- whatever floor is around it, and answering 0 assumed that floor was the
+  -- world datum.  Mt Chimney's cable car forecourt is a terrace at 32 with a
+  -- bush standing on it; the bush's own cell carries no run, so it answered
+  -- 0 while both its neighbours answered 32 -- a 32px hole either side of one
+  -- cell, in the middle of a plaza.
+  --
+  -- `standHeight` is the same question a doorway and a stamp already ask:
+  -- what floor is this cut into.  Only walkable cells ask it -- a blocked
+  -- cell's height is its own business.
+  --
+  -- `standHeight` is NOT the right question here, though it is the obvious
+  -- one: its ring reaches three cells and on open routes that is far enough
+  -- to find some unrelated rise and drag the cell up to it.  Tried, and it
+  -- fixed Mt Chimney and Sootopolis at the cost of eight new steps on Route
+  -- 115 and three on Route 120 -- a net loss.
+  --
+  -- The conservative form is the one that holds: only the four cells
+  -- TOUCHING this one vote, only walkable floor among them, and only when
+  -- they AGREE.  A bush standing in a plaza has terrace on every side and
+  -- takes it; a cell on open ground has neighbours that differ, or none, and
+  -- keeps the datum.
+  local okWalk, walkable = pcall(map.isWalkableCell, map, cellX, cellY)
+  if okWalk and walkable then
+    local agreed, seen = nil, false
+    for _, d in ipairs({ { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 } }) do
+      local nx, ny = cellX + d[1], cellY + d[2]
+      if map:inBounds(nx, ny) then
+        local okN, nw = pcall(map.isWalkableCell, map, nx, ny)
+        if okN and nw then
+          -- what does the neighbour stand on?  a measured run, else its own
+          -- flat floor.  A neighbour with neither ABSTAINS rather than
+          -- vetoing: vetoing meant one un-flat neighbour silenced the whole
+          -- vote, which is why the plaza bush kept its hole.
+          local ns = Structures.runHeight(map, nx * 2, ny * 2 + 1)
+          if ns == nil and Structures.flatGroundAt then
+            ns = Structures.flatGroundAt(map, nx * 2, ny * 2 + 1)
+          end
+          if ns ~= nil then
+            if not seen then agreed, seen = ns, true
+            elseif agreed ~= ns then agreed = nil break end
+          end
+        end
+      end
+    end
+    if agreed and agreed > 0 then return agreed end
+  end
+  return 0
 end
 
 VoxelScene.YAW = YAW
@@ -272,8 +563,13 @@ local function drawShadow(sprite, px, py, facing, phase, flip, gh, lift)
   local frame, mirror = frameFor(def, facing, phase, flip)
   local mesh = SpriteBillboards.shadowQuad(def, frame)
   if not mesh then return end
+  -- the decal is the card squashed onto the ground, so it is anchored like
+  -- the card (see drawEntity); nil anchor leaves it exactly as it was
+  local half = (SpriteBillboards.halfWidth and SpriteBillboards.halfWidth(def)) or 8
+  local anchor = SpriteBillboards.footAnchor and SpriteBillboards.footAnchor(def)
   Voxel3D.draw(mesh, sprite:resolveImage(),
-               Voxel3D.shadowMatrix(px, py, gh, lift, mirror))
+               Voxel3D.shadowMatrix(px, py, gh, lift, mirror,
+                                    anchor and half, anchor))
 end
 
 -- Where a billboard character's card stands: on the middle of its cell at
@@ -305,12 +601,18 @@ local function leanAngle()
   return VoxelScene.spriteLean or V.require("VoxelState").angle
 end
 
-local function billboardMatrix(px, py, y, mirror, half)
+-- `half` is the CARD's half-width; `anchor` is the middle of the FOOTPRINT it
+-- stands on, which is 8 for anything standing on one cell however wide it is
+-- drawn (see SpriteBillboards.footAnchor -- a surfing or cycling player in
+-- Hoenn wears a 32-wide sheet on a 16-wide cell). Omitted, anchor falls back
+-- to `half`, which is the 2x2-footprint reading every existing caller had.
+local function billboardMatrix(px, py, y, mirror, half, anchor)
   half = half or 8
+  anchor = anchor or half
   local b = FirstPerson.cardBlend()
-  local m = Mat4.translate(px + half, y, py + half)
+  local m = Mat4.translate(px + anchor, y, py + anchor)
   if b > 0 then
-    m = Mat4.mul(m, Mat4.rotateY(FirstPerson.cardYaw(px + half, py + half) * b))
+    m = Mat4.mul(m, Mat4.rotateY(FirstPerson.cardYaw(px + anchor, py + anchor) * b))
   end
   m = Mat4.mul(m, Mat4.rotateX((leanAngle() - math.pi / 2) * (1 - b)))
   if mirror then m = Mat4.mul(m, Mat4.scale(-1, 1, 1)) end
@@ -401,10 +703,24 @@ local function drawEntity(sprite, px, py, facing, phase, flip, gh, colors,
   --
   -- halfWidth: 8 for normal 16x16 walkers, 16 for 32x32 big dolls (Snorlax)
   -- so the card is centred on the 2x2 footprint rather than the top-left cell.
+  --
+  -- ...AND A GEN 3 SHEET IS WIDE WITHOUT HAVING A 2x2 FOOTPRINT. The surfing
+  -- player off Route 118 wears a 32x32 sheet on one cell, and centring the
+  -- card on its own half put it 8px east and 8px south of where the flat path
+  -- blits it. `footAnchor` is the middle of the cell for exactly those sheets
+  -- and nil for every Gen 1 / Gen 2 / Prism one, whose two matrices below are
+  -- then built from the identical arithmetic they always were.
   local half = (SpriteBillboards.halfWidth and SpriteBillboards.halfWidth(def)) or 8
-  Voxel3D.draw(mesh, tex, billboardMatrix(px, py, y, mirror, half),
+  local anchor = SpriteBillboards.footAnchor and SpriteBillboards.footAnchor(def)
+  -- the sun stores the card UNLEANED, and the lit card looks its own shadowing
+  -- up through the same transform -- "the lookup must match the stored
+  -- transform to the letter", above. casterMatrix had 8 written into it, so a
+  -- wide card was stored a half-width away from where it is drawn; pass the
+  -- pair only where the anchor answered, so nothing else moves.
+  Voxel3D.draw(mesh, tex, billboardMatrix(px, py, y, mirror, half, anchor),
                billboardPull(),
-               ShadowMap.snug(Voxel3D.casterMatrix(px, py, y, mirror)))
+               ShadowMap.snug(Voxel3D.casterMatrix(px, py, y, mirror,
+                                                   anchor and half, anchor)))
   return true
 end
 
@@ -430,8 +746,11 @@ local function drawGhost(p)
     tex = TerrainAtlas.forSprite(def.image, p.colors) or tex
   end
   local y = p.gh + (p.lift or 0)
+  -- the silhouette has to stand exactly where the solid card stands or it
+  -- reads as a second character, so it takes the same anchor (see drawEntity)
   local half = (SpriteBillboards.halfWidth and SpriteBillboards.halfWidth(def)) or 8
-  Voxel3D.draw(mesh, tex, billboardMatrix(p.px, p.py, y, mirror, half),
+  local anchor = SpriteBillboards.footAnchor and SpriteBillboards.footAnchor(def)
+  Voxel3D.draw(mesh, tex, billboardMatrix(p.px, p.py, y, mirror, half, anchor),
                billboardPull())
 end
 
@@ -444,6 +763,155 @@ end
 -- The last live-set key, so eviction only runs when the neighbourhood
 -- actually changes (a map crossing), not every frame.
 local lastLiveKey = nil
+
+-- THE RECTANGLES A MAP'S BORDER RING IS CUT AGAINST, IN ITS OWN WORLD PIXELS.
+--
+-- `runGeometry` suppresses ring geometry wherever another map's BODY sits,
+-- because with a depth buffer the ring's standing trees would otherwise rise
+-- straight through that map's flat ground -- cross into Route 1 and a wall of
+-- border trees sprouts over Pallet.
+--
+-- That set used to be read off `state.neighbors`, the maps the engine loaded
+-- around the map the PLAYER is on.  It is the right answer for exactly one
+-- map in the frame: the player's.  Every other map drawn beside it needs its
+-- OWN surroundings cut out of its OWN ring, and reading the player's would
+-- put the holes in the wrong places.
+--
+-- So ask the engine the same question it asked itself.
+-- `OverworldState.computeNeighbors` IS the placement arithmetic that put the
+-- neighbours where they are drawn, and run from any map id it answers that
+-- map's own neighbourhood, offsets and all.
+--
+-- TWO HOPS, PLUS THE RING'S OWN REACH, AND NOT THE CAMERA'S.  Two hops
+-- because that is what the engine LOADS and draws
+-- (`constants.world.neighborHops`, FieldDefaults): a body outside that set
+-- is not in the frame, so cutting the ring against it would cut a hole and
+-- cover nothing.  But two hops is a graph bound, not a geometric one, and on
+-- the water the two come apart -- Ever Grande's ring lies over Route 126,
+-- three connections away round the sea -- so the walk is also given the
+-- reach below (see masksFor), which is the ring's own 96 px and stops there.
+--
+-- The CAMERA's reach is the one deliberately left out.  `neighborReach` is
+-- half the renderer's view plus 64 px: it changes with the window, and a
+-- mask that changes with the window is not a property of the map.  Keeping
+-- it out is what lets the mesh, and its disk-cache key (VoxelDiskCache's
+-- maskSignature), mean the same thing whether the map is the one under the
+-- player's feet or one drawn beside it, so no map is ever re-meshed for
+-- having been approached from a different direction, and the full slot
+-- becomes as prebakeable as the body one.
+--
+-- What that costs is bounded and was measured: against the engine's own set
+-- there is NO map it fails to mask at the flat renderer's 144x136 reach, nor
+-- at 320x240; only past a 512x384 view do six roots pull in nine bodies this
+-- does not cut against, and a ring quad over a body that far out is behind
+-- the camera's own shoulder.  (Before the ring reach was handed to the walk,
+-- that shortfall was 15 entries over 10 roots at EVERY view -- 9,568 ring
+-- tiles, 51,654 quads of Petalburg's ring standing over the seabed of
+-- Underwater_Route105 and 3,802 of Ever Grande's over Route 126's water.)
+--
+-- `def.blockPx` and not `tileset.blockTiles * 8`: the same 16 on a Gen 3
+-- metatile and the same 32 on a Gen 1/Gen 2 block, but it is the field the
+-- engine's own placement reads, so a mask can never disagree with where the
+-- body it covers was actually drawn.  (Read as a flat 32, a Hoenn mask came
+-- out twice the map's size and suppressed the ring over ground no neighbour
+-- covers -- a strip of missing world along every seam.)
+--
+-- Measured, 81 outdoor maps: of 326,320 ring tiles carrying a shape, 113,800
+-- (34.9%) sit under a directly connected body, 126,568 (38.8%) under the
+-- two-hop set, and 136,136 (41.7%) once the ring's own reach is added.  The
+-- 12,768-tile step from one hop to two is corner ground beyond a neighbour's
+-- neighbour -- 3.9% of the ring.  When THIS map is the player's those maps
+-- are drawn and the mask is exactly right; when it is a neighbour they may
+-- be a hop too far to be loaded, and that corner reads as sky.  It is a
+-- corner two maps out, against a whole missing tree wall one map out, which
+-- is what this replaces.
+local maskMemo = {}
+local maskMaps, maskCompute = nil, nil
+
+-- The two engine handles the answer needs: the map table, and the neighbour
+-- walk.  Taken from the state when there is one, from the live overworld when
+-- there is not, and from `Game.data` plus OverworldController's own function
+-- when there is no overworld either -- so a prebake started from the settings
+-- menu asks the same question the renderer does whether or not a game has
+-- been loaded behind the menu.  A miss is never memoised: the world may
+-- simply not be up yet.
+local function maskEngine(state)
+  if maskMaps and maskCompute then return maskMaps, maskCompute end
+  local okG, G = pcall(require, "src.core.Game")
+  G = okG and G or nil
+  if not state then state = G and G.overworld or nil end
+  local data = (state and state.game and state.game.data) or (G and G.data)
+  local compute = state and state.computeNeighbors
+  if type(compute) ~= "function" then
+    -- NO OVERWORLD IS NOT NO ANSWER.  `computeNeighbors` is a pure function
+    -- of the map table hanging off OverworldState, not a method of a live
+    -- one, and the prebake can be started from the settings menu before a
+    -- game has been loaded at all -- where, read only off `Game.overworld`,
+    -- this returned nil, `ChunkMesher.bake` declined every map for want of a
+    -- mask resolver, and PREBAKE VOXELS counted its way through the region
+    -- baking nothing.
+    local okO, OS = pcall(require, "src.world.OverworldController")
+    compute = okO and type(OS) == "table" and OS.computeNeighbors or nil
+  end
+  if data and data.maps and type(compute) == "function" then
+    maskMaps, maskCompute = data.maps, compute
+  end
+  return maskMaps, maskCompute
+end
+
+function VoxelScene.masksFor(map, state)
+  local id = map and map.id
+  if not id then return nil end
+  local hit = maskMemo[id]
+  if hit ~= nil then return hit or nil end
+  local maps, compute = maskEngine(state)
+  if not (maps and compute) then return nil end
+  -- ...AND EVERY BODY THE RING CAN ACTUALLY TOUCH, WHICHEVER HOP IT IS ON.
+  --
+  -- Two hops is the set the engine LOADS, not the set that can stand under
+  -- this map's ring, and on the water the two come apart: Ever Grande's ring
+  -- lies over Route 126, which is three connections away round the sea, and
+  -- a two-hop walk does not cut it.  `computeNeighbors` takes a reach for
+  -- exactly this and keeps walking while a body still overlaps the root's
+  -- rect inflated by it, so the ring's OWN extent is the honest number to
+  -- hand it: ChunkMesher builds `r = RING * 4` tiles of ring at eight pixels
+  -- a tile, and nothing further out than that can be under any of it.
+  --
+  -- It stays a property of the MAP -- 96 is this mod's constant, not the
+  -- camera's -- and it is the reach the ENGINE's own set already had: with
+  -- it, the maps this cuts against are exactly the maps the frame draws, on
+  -- every one of the 81 outdoor maps, at the flat renderer's 144x136 reach
+  -- and at a 320x240 one.  Without it, ten roots masked LESS than the frame
+  -- drew -- 9,568 ring tiles, 3,168 of them Ever Grande's standing over
+  -- Route 126's water, which is a tree in the sea.
+  local RING_PX = 96
+  local okN, list = pcall(compute, maps, id, 2, RING_PX, RING_PX)
+  if not (okN and type(list) == "table") then
+    maskMemo[id] = false
+    return nil
+  end
+  local masks = {}
+  for _, n in ipairs(list) do
+    local d = maps[n.id]
+    if d and tonumber(d.width) and tonumber(d.height) then
+      local px = tonumber(d.blockPx) or 32
+      masks[#masks + 1] = { n.ox, n.oy,
+                            n.ox + d.width * px, n.oy + d.height * px }
+    end
+  end
+  maskMemo[id] = masks
+  return masks
+end
+
+-- Map data is static for the run, so the answer is too; this exists for a
+-- host that swaps the cartridge under us (the dev console's map reload).
+function VoxelScene.forgetMasks()
+  maskMemo, maskMaps, maskCompute = {}, nil, nil
+end
+
+-- ...and the prebake pass asks the same question, so a baked FULL entry
+-- carries the key the live request will look it up under (ChunkMesher.bake).
+ChunkMesher.masksFor = VoxelScene.masksFor
 
 -- Request everything `state`'s frame wants and evict what it no longer
 -- does; returns the current map's terrain mesh (or nil while it builds)
@@ -477,13 +945,29 @@ function VoxelScene.prefetch(state)
     TerrainAtlas.setLive(live)
   end
 
-  -- masks: where connected neighbour BODIES sit, so the border ring is
-  -- suppressed under them (see runGeometry)
-  local masks = {}
-  for _, nb in ipairs(state.neighbors or {}) do
-    masks[#masks + 1] = { nb.ox, nb.oy,
-                          nb.ox + nb.map.def.width * 32,
-                          nb.oy + nb.map.def.height * 32 }
+  -- masks: where the bodies around a map sit, so its border ring is
+  -- suppressed under them (see masksFor above, and runGeometry).  Every map
+  -- in the frame gets its own set now, this one included.
+  --
+  -- `masksFor` answers nil only when it cannot reach the engine's own map
+  -- table or `computeNeighbors` -- a host that has not published them, or a
+  -- cartridge swapped under us mid-frame.  NIL IS NOT AN EMPTY MASK SET: an
+  -- unmasked full build stands this map's border trees up through every
+  -- neighbour's ground, which is the failure the mask exists to prevent.  So
+  -- the degenerate case falls back to the derivation this pass used before
+  -- the ring was given to neighbours -- the rectangles of the bodies the
+  -- engine has ALREADY placed around the player, which is exactly the old
+  -- answer for the old (and only the old) map, the player's.
+  local masks = VoxelScene.masksFor(state.map, state)
+  if not masks then
+    masks = {}
+    for _, nb in ipairs(state.neighbors or {}) do
+      local px = (tonumber(nb.map.def and nb.map.def.blockPx)
+                  or (tonumber(nb.map.tileset and nb.map.tileset.blockTiles) or 4) * 8)
+      masks[#masks + 1] = { nb.ox, nb.oy,
+                            nb.ox + nb.map.def.width * px,
+                            nb.oy + nb.map.def.height * px }
+    end
   end
 
   -- Builds are asynchronous (ChunkMesher.pump runs in the pipeline's
@@ -505,16 +989,132 @@ function VoxelScene.prefetch(state)
   if not terrain then
     terrain, water = ChunkMesher.pair(state.map, true)
   end
+  -- ...AND A NEIGHBOUR HAS A HORIZON TOO.
+  --
+  -- Every neighbour used to be meshed `bodyOnly`: the current map supplies
+  -- the ring around the view and a neighbour contributes its body.  That is
+  -- the 2D path's shape and on a flat screen it is right, because the flat
+  -- renderer tiles the border patch to the edge of the SCREEN and the current
+  -- map's ring is the horizon for the whole frame.
+  --
+  -- A diorama camera sees several map-widths out, and there each neighbour
+  -- simply STOPS at its own body edge -- a straight line of town with the sky
+  -- behind it.  In-game: stand anywhere on Route 101 and look north at
+  -- Oldale, or west from Oldale at Route 102 -- "many of the towns still are
+  -- missing their tree borders".
+  --
+  -- Region-wide, 81 outdoor maps: 190,184 border-ring TILES carry a shape
+  -- that no body around them covers -- 47,546 cells of modelled tree wall
+  -- that got built for exactly one map per frame.  On the frames themselves,
+  -- under POKEPORT_SKY_FLAT: giving every neighbour its own ring turns 50,506
+  -- pixels of void into terrain on the Oldale frame and 36,128 on Route
+  -- 101's, and turns none of it the other way.
+  --
+  -- So a neighbour is asked for its FULL mesh, and its own masks do the
+  -- asymmetry for nothing: the side facing this map is covered by this map's
+  -- body and is cut away, so what actually gets built is the ring on the
+  -- sides facing OUT -- which is the only part of it anyone can see.
+  --
+  -- This is not extra work spread over the walk, it is the SAME work moved
+  -- earlier: the full mesh a map needs when you step onto it is now already
+  -- built and cached from when it was a neighbour, so a seam crossing costs
+  -- nothing where it used to cost a whole rebuild.  A neighbour with no full
+  -- mesh yet still draws its body variant if one happens to be cached.
+  --
+  -- And the same rule as above about a nil answer, with the same reason and
+  -- a different remedy: there is no older derivation for a NEIGHBOUR's own
+  -- surroundings to fall back to, so a neighbour whose masks cannot be
+  -- resolved is meshed exactly as it was before this change -- body only,
+  -- no ring.  It loses its horizon, which is the defect this pass fixes; it
+  -- does not grow a tree wall through the map the player is standing on,
+  -- which would be a worse one.
   local nbMesh, nbWater = {}, {}
   for i, nb in ipairs(state.neighbors or {}) do
-    ChunkMesher.request(nb.map, true)
-    nbMesh[i], nbWater[i] = ChunkMesher.pair(nb.map, true)
-    if not nbMesh[i] then
+    local nbMasks = VoxelScene.masksFor(nb.map, state)
+    if nbMasks then
+      ChunkMesher.request(nb.map, false, nbMasks)
       nbMesh[i], nbWater[i] = ChunkMesher.pair(nb.map, false)
+      if not nbMesh[i] then
+        nbMesh[i], nbWater[i] = ChunkMesher.pair(nb.map, true)
+      end
+    else
+      ChunkMesher.request(nb.map, true)
+      nbMesh[i], nbWater[i] = ChunkMesher.pair(nb.map, true)
     end
   end
   Voxel.ready = terrain ~= nil
   return terrain, nbMesh, water, nbWater
+end
+
+-- AN OBJECT THE CARTRIDGE NEVER DRAWS IS NOT PART OF THE CAST.
+--
+-- In-game location: UNDERWATER, THE SEAFLOOR CAVERN BAY -- the submarine
+-- EXPLORER 1, cells (5,4) (6,4) (7,4) (8,4).
+--
+-- The hull is drawn in the MAP ART (Underwater metatiles 736-747, four cells
+-- across and three rows deep), and Emerald stands four object events under it
+-- so that talking to any of its four cells prints "\"SUBMARINE EXPLORER 1\"
+-- is painted on the hull."  All four are graphics id 100 carrying movement
+-- type 0x4C, and 0x4C is the cartridge's own HIDDEN type: an object that
+-- exists for its collision and its script and is never blitted.  This pass
+-- drew all four, so a diver arriving in the bay was met by four copies of a
+-- character standing in a row over the sub -- reported as "the submarine
+-- shows 4 player characters".  The count is the CARTRIDGE's, not a
+-- duplication: four object events, one per cell of a four-cell hull.
+--
+-- 0x4C is read, not guessed.  Sixteen object events in Hoenn carry it and
+-- NINE are the invisible KECLEON -- Fortree City 1, Route 118 2, Route 120 6
+-- -- whose shared script opens `checkitem 288`, the DEVON SCOPE, "a device
+-- that signals any unseeable POKEMON", and whose reveal movement is literally
+-- `set_visible` / `set_invisible` flashing before `setwildbattle`.  The other
+-- three are one hidden helper each in Devon Corp 3F, Steven's House and the
+-- Mossdeep Space Center.  No other movement type shares 0x4C's step callback.
+--
+-- The flat 2D pass has always honoured `e.hidden` -- the field a script's
+-- set_visible / set_invisible writes -- and this pass never did, which is the
+-- same divergence a second time.  Both readings are folded in here, in the
+-- cartridge's own order of authority:
+--
+--   e.hidden == true    a script has hidden it                 -> not drawn
+--   e.hidden == false   a script has REVEALED it               -> drawn
+--                       (a Kecleon, once the DEVON SCOPE is out)
+--   e.hidden == nil     nobody has spoken, so the template's
+--                       own movement type answers
+--
+-- `gen3MovementType` is asked first because `setobjectmovementtype` writes
+-- that and leaves the template alone.  A Gen 1, Gen 2 or Prism object carries
+-- no `movementType` at all, so this is nil for every one of them and the
+-- answer falls back to exactly the `e.hidden` the flat path already gave.
+local GEN3_MOVEMENT_HIDDEN = 0x4C
+
+local function castHides(e, isPlayer)
+  if e == nil then return false end
+  local told = e.hidden
+  if told ~= nil then return told and true or false end
+  -- ...AND THE MOVEMENT TYPE IS ASKED ONLY OF AN OBJECT EVENT.
+  --
+  -- MOTIVATED BY THE PLAYER GOING INVISIBLE IN LITTLEROOT TOWN.
+  --
+  -- 0x4C is a value in `gObjectEventGraphicsInfo`'s movement table, and the
+  -- player is not an object event -- they are the engine's own actor, with
+  -- no entry in it.  Anything named `movementType` reachable from the player
+  -- is therefore not that table's index and must not be read as one: a
+  -- single collision drops the one actor the camera is following, and the
+  -- frame has no player in it at all.
+  --
+  -- `e.hidden` is still honoured for the player, because a SCRIPT hiding
+  -- them (Gen3Commands' `player.hidden = (not visible) or nil`) is a
+  -- cutscene statement the flat path obeys and the diorama must too.
+  -- The caller passes `isPlayer` because identity is the only reliable test:
+  -- `Player` advertises no flag of its own, and every duck-typed guess
+  -- (`e.isPlayer`, `e.kind`) is a field that may simply not be there.
+  if isPlayer then return false end
+  local mt = tonumber(e.gen3MovementType)
+  if mt == nil then
+    local d = e.def
+    mt = d and tonumber(d.movementType) or nil
+  end
+  return mt == GEN3_MOVEMENT_HIDDEN
 end
 
 -- Capture every entity's pose for this frame. pose() advances the hop /
@@ -535,29 +1135,38 @@ local function posesOf(state, spriteColors)
   local posed = {}
   local me = nil
   for _, g in ipairs(state.ghosts or {}) do
+    -- pose() ADVANCES the hop / surf-bob / spinner timers, and the contract
+    -- above is that it runs exactly once per entity per frame -- so a hidden
+    -- actor is still POSED and only its card is dropped.  Posing it
+    -- conditionally would leave it a frame behind every time it reappeared.
     local sprite, vx, vy, facing, phase, flip = g.npc:pose()
-    posed[#posed + 1] = {
-      sprite = sprite, px = vx + g.ox, py = g.npc.py + g.oy,
-      facing = facing, phase = phase, flip = flip,
-      gh = groundAt(g.map or state.map, g.npc.cellX, g.npc.cellY),
-      lift = g.npc.py - vy, colors = spriteColors(g.map or state.map),
-    }
+    if not castHides(g.npc) then
+      posed[#posed + 1] = {
+        sprite = sprite, px = vx + g.ox, py = g.npc.py + g.oy,
+        facing = facing, phase = phase, flip = flip,
+        gh = groundAt(g.map or state.map, g.npc.cellX, g.npc.cellY,
+                      g.npc.elevation, vx + g.ox, g.npc.py + g.oy),
+        lift = g.npc.py - vy, colors = spriteColors(g.map or state.map),
+      }
+    end
   end
   for _, e in ipairs(state.entities or {}) do
     if not (state.flyAnim and e == state.player) then
       local sprite, vx, vy, facing, phase, flip = e:pose()
-      posed[#posed + 1] = {
-        sprite = sprite, px = vx, py = e.py,
-        facing = facing, phase = phase, flip = flip,
-        gh = groundAt(state.map, e.cellX, e.cellY),
-        lift = e.py - vy, colors = colors,
-      }
-      if e == state.player then
-        me = posed[#posed]
-        -- marked so the camera draw can leave the card out in first
-        -- person, where it would fill the lens from inside; the SUN pass
-        -- reads the same list and deliberately does not check the mark
-        me.isPlayer = true
+      if not castHides(e, e == state.player) then
+        posed[#posed + 1] = {
+          sprite = sprite, px = vx, py = e.py,
+          facing = facing, phase = phase, flip = flip,
+          gh = groundAt(state.map, e.cellX, e.cellY, e.elevation, vx, e.py),
+          lift = e.py - vy, colors = colors,
+        }
+        if e == state.player then
+          me = posed[#posed]
+          -- marked so the camera draw can leave the card out in first
+          -- person, where it would fill the lens from inside; the SUN pass
+          -- reads the same list and deliberately does not check the mark
+          me.isPlayer = true
+        end
       end
     end
   end
@@ -575,6 +1184,10 @@ end
 -- texels (see the scene shader), so this is a FRACTION of a texel per world
 -- pixel walked -- one full pass of the glint across a pane per eight or so
 -- cells of travel, with no frame ever jumping it far enough to strobe.
+-- The camera's own vertical follow: where the view centre currently sits,
+-- and the map it was measured on (a map change snaps rather than glides).
+local groundFollow = { y = nil, map = nil }
+
 VoxelScene.GLINT_RATE = 0.05     -- radians of sweep per world pixel travelled
 VoxelScene.GLINT_IN = 0.12      -- strength gained per moving frame
 VoxelScene.GLINT_OUT = 0.08     -- and lost per resting frame
@@ -879,10 +1492,18 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
     local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip)
     local mesh = SpriteBillboards.shadowQuad(def, frame)
     if mesh then
+      -- the same pair the camera draw uses, or the sun files a wide card
+      -- half a width away from where the lit one asks about it (see
+      -- drawEntity, and SpriteBillboards.footAnchor for the rule)
+      local sHalf = (SpriteBillboards.halfWidth
+                     and SpriteBillboards.halfWidth(def)) or 8
+      local sAnchor = SpriteBillboards.footAnchor
+                      and SpriteBillboards.footAnchor(def)
       ShadowMap.draw(mesh, p.sprite:resolveImage(),
                      ShadowMap.snug(
                        Voxel3D.casterMatrix(p.px, p.py, p.gh + (p.lift or 0),
-                                            mirror)))
+                                            mirror, sAnchor and sHalf,
+                                            sAnchor)))
     end
   end
   -- a staged fight's mons (VR frames only): the same cards the eye pass
@@ -902,13 +1523,43 @@ end
 -- scene centre -- the same frame is drawn once per entry and the list of
 -- canvases comes back: the VR path, two eyes over one shared shadow map,
 -- pose capture and glint step.
+-- one line per map, so a flat world explains itself without flooding
+local reportedNoMesh = {}
+
 function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   -- With nothing cached at all (the first frame of a fresh toggle),
   -- return nil: the engine keeps the 2D path for the frame and
   -- Voxel.ready holds the camera tween at flat, so the switch waits
   -- invisibly instead of freezing or tilting an empty stage.
   local terrain, nbMesh, water, nbWater = VoxelScene.prefetch(state)
-  if not terrain then return nil end
+  if not terrain then
+    -- SAY WHY, ONCE.  Returning nil here is indistinguishable from "the mod
+    -- chose not to draw": the engine keeps the flat path and the player sees
+    -- the voxel setting do nothing at all, with an empty log.  On the first
+    -- frame of a toggle that is correct and temporary; when a build has
+    -- FAILED it is permanent, because a failed slot caches `false` and is
+    -- never retried.  Those two need telling apart from outside.
+    local map = state and state.map
+    local id = map and map.id
+    if id and not reportedNoMesh[id] then
+      reportedNoMesh[id] = true
+      local why = ChunkMesher.buildFailure and ChunkMesher.buildFailure(id)
+      pcall(function()
+        local Logger = require("src.core.Logger")
+        if why then
+          Logger.warn("voxel world: no mesh for %s and the build FAILED -- "
+                      .. "the world will stay flat on this map: %s",
+                      tostring(id), tostring(why))
+        else
+          Logger.info("voxel world: no mesh for %s yet (queued) -- flat for "
+                      .. "now%s", tostring(id),
+                      Gen3.status and (" | " .. tostring(Gen3.status(map) or ""))
+                      or "")
+        end
+      end)
+    end
+    return nil
+  end
 
   local cam = state.camera
   local cx, cy = cam.x + vw / 2, cam.y + vh / 2
@@ -944,6 +1595,44 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   end
 
   local posed, me = posesOf(state, spriteColors)
+
+  -- THE CAMERA RIDES WITH THE PLAYER, IN Y AS WELL AS IN X AND Z.
+  --
+  -- The orbit is centred on the view centre the flat renderer already
+  -- computed, and it used to look at the world datum -- Y = 0 -- however
+  -- high the player had climbed.  On a flat town that is invisible; on
+  -- Sootopolis, Mossdeep or Lavaridge it is not: step up a flight and the
+  -- terrace rises under you while the view stays pinned to the water
+  -- level, so the player slides up the frame and the shot fills with the
+  -- ground behind them.  The 2D camera follows the player exactly and this
+  -- one now does too, lifting eye and focus together so the framing is
+  -- unchanged and only its datum moves.
+  --
+  -- The CELL's height, not the sprite's: `gh` is what the walker is
+  -- standing on, while `py` arcs through a ledge hop and bobs on a surf.
+  -- Following the sprite would make the whole world jump with every hop.
+  -- ...eased, not snapped.  A step up is a whole course in one frame -- the
+  -- cell's height changes the instant the walk starts -- and moving the
+  -- camera that far in one frame throws the entire world down the screen.
+  -- A short exponential settle (about a twelfth of a second) reads as the
+  -- camera keeping up rather than as a cut, and is over before the step is.
+  -- A map change snaps: gliding a storey on arrival is a warp that looks
+  -- like a fall.
+  local targetY = (me and me.gh) or 0
+  local mapId = state.map and state.map.id
+  local dtc = (love.timer and love.timer.getDelta and love.timer.getDelta())
+              or (1 / 60)
+  if dtc ~= dtc or dtc < 0 then dtc = 1 / 60 end
+  if dtc > 0.1 then dtc = 0.1 end
+  if groundFollow.map ~= mapId or groundFollow.y == nil then
+    groundFollow.map, groundFollow.y = mapId, targetY
+  elseif math.abs(targetY - groundFollow.y) < 0.25 then
+    groundFollow.y = targetY
+  else
+    groundFollow.y = groundFollow.y
+                     + (targetY - groundFollow.y) * (1 - math.exp(-dtc * 14))
+  end
+  Voxel3D.groundY = groundFollow.y
 
   -- The first-person rig, built (or blended) for this frame and handed to
   -- Voxel3D BEFORE either pass runs: the sun's box is fitted around this

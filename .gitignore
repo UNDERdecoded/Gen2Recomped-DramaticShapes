@@ -1,0 +1,19 @@
+# Bytecode from the authoring tools in tools/ and
+# assets/docs/buidling_to_voxel/ -- generated on whatever machine ran them.
+__pycache__/
+*.py[cod]
+
+# agent worktrees and local scratch
+.claude/
+
+# Bring-your-own battle art. Preserve the documented example directory tree,
+# but never commit locally supplied artwork, atlases, drafts, or sidecars.
+assets/battle/**
+!assets/battle/**/
+!assets/battle/**/README.md
+
+# Local WORLD FILL source art. Keep the integration and asset notes tracked,
+# but do not publish these supplied PNGs in this repository's history.
+assets/world-fill/fieldsafari.png
+assets/world-fill/grassyforest.png
+assets/world-fill/rockycave.png

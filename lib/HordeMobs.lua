@@ -88,7 +88,7 @@ local CAST = {
   "SPRITE_MIDDLE_AGED_MAN", "SPRITE_FISHER", "SPRITE_GAMBLER",
 }
 
-local OWNER = "DRAMATIC_SHAPE"
+local OWNER = "BATTLE_ART_VOXEL_GEN2"
 
 -- ------- the flow field
 --

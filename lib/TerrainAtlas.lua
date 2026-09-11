@@ -39,8 +39,7 @@ local TerrainAtlas = {}
 
 local cache = {}
 local cacheData = {}    -- the pixels behind the atlases we baked ourselves
--- one line per (map, atlas), so the branch is stated without a log flood
-local reported = {}
+local borderColorCache = {} -- atlas -> { blockId -> dominant border color }
 local animated = {}     -- key -> one map's private, mutable animated atlas
                         -- false = given up on; nil = not built (or retrying)
 local attempts = {}     -- key -> consecutive failures, for the retry budget
@@ -845,9 +844,63 @@ function TerrainAtlas.setLive(live)
   end
 end
 
+-- The dominant opaque color of one border block, read back from the baked
+-- atlas. WORLD FILL's indoor underlay matches the room's own border material
+-- so the finite map ring cannot reveal a different infinite fill behind it.
+function TerrainAtlas.borderBlockColor(map, colors, blockId)
+  if not (map and map.tileset and blockId ~= nil) then return nil end
+  if blockId == false then return { 0, 0, 0, 1 } end
+
+  local atlas, baked = staticAtlas(map, colors)
+  if not atlas then return nil end
+  local perImage = borderColorCache[atlas]
+  if not perImage then
+    perImage = {}
+    borderColorCache[atlas] = perImage
+  end
+  if perImage[blockId] then return perImage[blockId] end
+
+  local block = map.tileset.blocks and map.tileset.blocks[blockId + 1]
+  if not block then return nil end
+  local data = baked or readback(atlas)
+  if not (data and data.getPixel) then return nil end
+
+  local perRow = map.tileset.tilesPerRow or 16
+  local counts, bestKey, bestCount, bestLum = {}, nil, -1, math.huge
+  for _, tile in ipairs(block) do
+    local sx, sy = (tile % perRow) * 8, math.floor(tile / perRow) * 8
+    for y = 0, 7 do
+      for x = 0, 7 do
+        local r, g, b, a = data:getPixel(sx + x, sy + y)
+        if a > 0 then
+          local R = math.floor(r * 255 + 0.5)
+          local G = math.floor(g * 255 + 0.5)
+          local B = math.floor(b * 255 + 0.5)
+          local key = R * 65536 + G * 256 + B
+          local n = (counts[key] or 0) + 1
+          counts[key] = n
+          local lum = R * 0.299 + G * 0.587 + B * 0.114
+          if n > bestCount or (n == bestCount and lum < bestLum) then
+            bestKey, bestCount, bestLum = key, n, lum
+          end
+        end
+      end
+    end
+  end
+  if not bestKey then return nil end
+
+  local R = math.floor(bestKey / 65536)
+  local G = math.floor(bestKey / 256) % 256
+  local B = bestKey % 256
+  local out = { R / 255, G / 255, B / 255, 1 }
+  perImage[blockId] = out
+  return out
+end
+
 function TerrainAtlas.invalidate()
   cache = {}
   cacheData = {}
+  borderColorCache = {}
   attempts = {}
   for _, entry in pairs(gen3Anim) do
     if entry and entry.image and entry.image.release then

@@ -27,7 +27,7 @@ local ModSetting = V.require("ModSetting")
 
 local VoxelGrid = {}
 
--- the key under options.modOptions.DRAMATIC_SHAPE, shared by the row in
+-- the key under options.modOptions.BATTLE_ART_VOXEL_GEN2, shared by the row in
 -- OPTIONS and the mod manager's own settings page for this mod
 VoxelGrid.KEY = "grid"
 VoxelGrid.LABEL = "V-GRID"

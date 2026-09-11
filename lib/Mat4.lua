@@ -150,4 +150,20 @@ function Mat4.lookAt(eye, target, up)
            0, 0, 0, 1 }
 end
 
+-- A camera-facing card centered on cell (px/16, py/16) with its feet on
+-- world y: T(cell center) * Ry(yaw) * Rx(pitch), optionally mirrored so a
+-- front pic faces the opponent. WORLD FILL's distant billboards use it.
+function Mat4.billboard(px, py, y, yaw, pitch, mirror)
+  local cy, sy = math.cos(yaw or 0), math.sin(yaw or 0)
+  local cx, sx = math.cos(pitch or 0), math.sin(pitch or 0)
+  local mx = mirror and -1 or 1
+
+  return {
+     cy * mx, sy * sx, sy * cx, px + 8 - 8 * cy * mx,
+     0,       cx,      -sx,     y,
+    -sy * mx, cy * sx, cy * cx, py + 8 + 8 * sy * mx,
+     0,       0,       0,       1,
+  }
+end
+
 return Mat4

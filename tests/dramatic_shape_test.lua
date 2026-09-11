@@ -4375,18 +4375,22 @@ T.check(near(fex, 96, 1e-3) and near(fey, 10, 1e-3) and near(fez, 192, 1e-3),
   "and the enemy slot's mark on the enemy's cell")
 
 -- and BILLBOARDED at an eye: seated east of the arena the frame turns
--- square to it, and the marks still land on the cells -- this eye's own
--- rays are what pinned them
+-- square to it and keeps each authored column over its cell without tilting
+-- the pixel art to absorb the perspective-only vertical mismatch
 V3D_.eye = { 200, 20, 216 }
 local fxb = BS_.fxCard(fxArena, 10, OB_.ANCHOR)
 T.check(near(fxb[3], 1, 1e-3) and near(fxb[11], 0, 1e-3),
   "the effects frame faces the eye in the east")
+T.check(near(fxb[5], 0, 1e-9),
+  "and its horizontal axis stays level instead of shearing the art")
 local bpx, bpy, bpz = apply(fxb, pa[1] / 160 - 0.5, 1 - pa[2] / 144, 0)
-T.check(near(bpx, 96, 1e-3) and near(bpy, 10, 1e-3) and near(bpz, 240, 1e-3),
-  "billboarded, the player mark still sits over the player's cell")
 local bex, bey, bez = apply(fxb, ea[1] / 160 - 0.5, 1 - ea[2] / 144, 0)
-T.check(near(bex, 96, 1e-3) and near(bey, 10, 1e-3) and near(bez, 192, 1e-3),
-  "and the enemy mark over the enemy's")
+T.check(near(bpx, 96, 1e-3) and near(bpz, 240, 1e-3),
+  "billboarded, the player column still sits over the player's cell")
+T.check(near(bex, 96, 1e-3) and near(bez, 192, 1e-3),
+  "and the enemy column over the enemy's")
+T.check(near(bpy - 10, 10 - bey, 1e-3),
+  "the vertical perspective mismatch is shared between the two sides")
 V3D_.eye = hadEye
 
 -- the FLAT first-person rig's sky fan: a placed eye/focus camera through

@@ -819,7 +819,7 @@ function VRXR.start(quadW, quadH)
   local okIn, errIn = pcall(setupInput)
   if not okIn then
     input = nil
-    print("[DRAMATIC_SHAPE] VR controllers unavailable: " .. tostring(errIn))
+    print("[BATTLE_ART_VOXEL_GEN2] VR controllers unavailable: " .. tostring(errIn))
   end
   status = "session created"
   return true

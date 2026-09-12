@@ -38,19 +38,48 @@
 --                what makes the far half of a lake sky and the near half
 --                scenery without a seam between them.
 --
---   the cast     the walkers, the NPCs, the authored figures and a staged
---                battle's two Pokemon. Awkward, and settled by drawing them
---                twice: Gen 1 draws people OVER the world and water is
---                world, so a surfing player has to composite after the
---                water, and a reflection can only hold what came before it.
---                So they are painted into the reflection copy alone
---                (Voxel3D.beginWater), in the picture the water reflects and
---                not yet in the picture it is drawn into.
+--   the cast     the walkers, the NPCs, the overworld Pokemon, the player,
+--                the authored figures and a staged battle's two Pokemon.
+--                Awkward, and settled by drawing them twice: Gen 1 draws
+--                people OVER the world and water is world, so a surfing
+--                player has to composite after the water, and a reflection
+--                can only hold what came before it. So they are painted
+--                into the reflection copy alone (Voxel3D.beginWater), in
+--                the picture the water reflects and not yet in the picture
+--                it is drawn into.
+--
+--                THEY ARE NOT IN THE MIRROR'S DEPTH, only in its colour
+--                (beginWater paints them depth-tested and write-free), and
+--                that is deliberate: the march tests against the TERRAIN
+--                standing behind a sprite, finds its contact there, and
+--                reads the copy at that pixel -- where the sprite is
+--                already painted over it. So a reflection lands a hair off
+--                the sprite's own depth and exactly on its colour, which at
+--                a lake's worth of ripple is the same picture. It also
+--                means the one thing a sprite needs in order to reflect at
+--                all is SOMETHING OPAQUE BEHIND IT: a walker silhouetted
+--                against open sky over the far shore has no contact for the
+--                ray to find and reflects nothing. That is the honest
+--                screen-space answer and it is left honest rather than
+--                faked, because the alternative -- giving sprites their own
+--                depth in the mirror -- punches them out of the water they
+--                are standing beside (see beginWater).
+--
+--                WATER SPRITES is the row that decides whether this half
+--                happens at all (Water.castSetting below). It is the only
+--                part of the reflection whose cost is DRAW CALLS rather
+--                than fill rate -- every card on screen a second time --
+--                so it is a separate question from how much of the WORLD
+--                the march reflects, and it is asked separately.
 --
 -- WHAT IT CANNOT REFLECT is what no screen-space reflection can: anything
 -- that is not in the frame. A tree just off the top edge is not in the water
 -- below it, and a ray that runs off the side of the screen fades into the
--- sky rather than ending on a line.
+-- sky rather than ending on a line. A sprite BEHIND THE CAMERA is not in the
+-- reflection copy either -- it was never rasterised into the frame the copy
+-- was taken of -- so the water under it answers with sky, which is the same
+-- thing it does for the tree off the top edge. A sprite standing AT THE
+-- WATER'S EDGE is on screen, and reflects.
 --
 -- THE SURFACE ITSELF is not flat. It is a heightfield of one-world-pixel
 -- columns, each standing a whole number of pixels tall and rising and
@@ -98,16 +127,115 @@ Water.setting = ModSetting.new(Water.KEY, Water.LABEL,
                                { "full", "sky", "off" },
                                { "FULL", "SKY", "OFF" })
 
+-- The PERFORMANCE tier's ceilings (see lib/Tier.lua), resolved lazily for
+-- the same reason ShadowMap's are.
+local Tier_
+local function caps()
+  if not Tier_ then Tier_ = V.require("Tier") end
+  return Tier_.caps()
+end
+
+-- The same lazy require, through the tier's own clamp rather than its table,
+-- for the rows whose level is a plain number (see Water.castLevel).
+local function clampTier(field, value)
+  if not Tier_ then Tier_ = V.require("Tier") end
+  return Tier_.clamp(field, value)
+end
+
 function Water.level()
   local v = Water.setting:get()
-  if v == "off" then return 0 end
-  if v == "sky" then return 1 end
-  return 2
+  local lv = 2
+  if v == "off" then lv = 0
+  elseif v == "sky" then lv = 1 end
+  -- A CEILING, NOT A SETTING.  The row's own three rungs are the player's
+  -- and are never rewritten; this is the most the tier will let the frame
+  -- spend on them, so BALANCED on a player who already chose SKY changes
+  -- nothing, and raising the tier hands FULL straight back.
+  --
+  -- FULL is the screen-space march -- twenty-odd samples of the depth
+  -- texture per water pixel -- and SKY is a handful of instructions with no
+  -- extra buffer read (see the row's help).  Geometry is identical at all
+  -- three rungs: the water surface is the same mesh drawn with a different
+  -- shader, so this buys fill rate and not one quad, and it buys nothing at
+  -- all on a map with no water in it.
+  local cap = caps().water
+  if cap and lv > cap then lv = cap end
+  return lv
 end
 
 -- Whether the reflective pass should run at all (either rung above OFF).
 function Water.enabled()
   return Water.level() > 0
+end
+
+-- ------- the cast's own row
+--
+-- MOTIVATED BY LILYCOVE CITY, which is the map this question is about: a sea
+-- edge along the whole south of the town and a hundred and thirty-odd NPCs
+-- standing on the market street above it.
+--
+-- WHY THIS IS A ROW OF ITS OWN AND NOT A FOURTH RUNG ON WATER.
+--
+-- The WATER ladder is ordered by HOW MUCH OF THE WORLD the surface reflects
+-- -- FULL marches the screen, SKY does not, OFF is flat water -- and each
+-- step down that ladder takes away fill rate in the pixel shader. The cast
+-- is not on that axis at all. It is not reflected BY the march; it is
+-- painted into the picture the march reads, and what it costs is the
+-- CAST DRAWN A SECOND TIME: one draw call per card per frame, geometry and
+-- submission rather than fill. Those are different budgets and they run out
+-- on different machines -- a phone is fill-bound and a laptop with a hundred
+-- and thirty walkers on screen is draw-call-bound -- so a player who wants
+-- the shoreline in the lake but cannot afford the crowd twice has nowhere to
+-- stand on a single ladder, and a player stepping FULL -> SKY would have to
+-- walk through a rung they never asked about to get there.
+--
+-- THE ROW CANNOT CONTRADICT THE WATER ROW, because it is not offered when it
+-- would. There is no mirror to be in below FULL -- `rays` is 0 and the
+-- shader never samples reflectTex at all (see march) -- so main.lua gates
+-- this row on Water.level() >= 2 and it simply is not on the menu otherwise.
+-- That is exactly the shape BACK SPRITES already has against a staged fight:
+-- a row that no longer decides anything is worse than no row. Nothing is
+-- stranded by hiding it, either -- the stored value is still ON, it just
+-- has nothing to be on ABOUT, and the row is back on the same keypress that
+-- puts WATER back to FULL.
+--
+-- ON by default, because this is what the mode has drawn since the
+-- reflection pass existed: the row is here to let a player turn the crowd
+-- out of the water, not to introduce them to it.
+Water.CAST_KEY = "watersprites"
+Water.CAST_LABEL = "WATER SPRITES"
+
+Water.castSetting = ModSetting.new(Water.CAST_KEY, Water.CAST_LABEL,
+                                   { true, false },
+                                   { "ON", "OFF" })
+
+-- 1 = paint the cast into the reflection copy, 0 = leave it out.
+--
+-- A NUMBER rather than a boolean so it can go through Tier.clamp, which is
+-- how every other ceiling in this mod is spent (ShadowMap.available,
+-- Water.level, AntiAlias.samples) and which clamps numbers only.
+function Water.castLevel()
+  -- Below FULL there is no march, so nothing ever reads the mirror and the
+  -- cast would be painted into a texture no shader samples. That is not a
+  -- look decision, it is dead work: at BALANCED the tier already holds WATER
+  -- at SKY, so before this existed every frame in Lilycove drew a hundred
+  -- and thirty-odd cards a second time for a picture nobody looked at.
+  if Water.level() < 2 then return 0 end
+  local lv = Water.castSetting:get() and 1 or 0
+  -- A CEILING, NOT A SETTING -- the same contract Water.level states above.
+  -- Redundant against today's CAPS, and deliberately so: BALANCED and LOW
+  -- already cap `water` below FULL, so the line above has answered 0 before
+  -- this one runs. It is written anyway because the two facts are
+  -- independent -- a tier that later decides it CAN afford the march but not
+  -- the crowd twice has somewhere to say so -- and because a ceiling that
+  -- only exists implicitly, as a consequence of another ceiling, is one
+  -- refactor away from silently not existing.
+  return clampTier("waterCast", lv)
+end
+
+-- Whether the cast is painted into the reflection copy this frame.
+function Water.reflectCast()
+  return Water.castLevel() > 0
 end
 
 -- ------- the look, in constants

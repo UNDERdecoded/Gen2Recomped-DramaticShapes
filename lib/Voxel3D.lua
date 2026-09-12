@@ -26,6 +26,7 @@
 local V = ...
 
 local Mat4 = V.require("Mat4")
+local MeshBounds = V.require("MeshBounds")
 local Voxel = V.require("VoxelState")
 local ShadowMap = V.require("ShadowMap")
 local VoxelGrid = V.require("VoxelGrid")
@@ -1355,6 +1356,31 @@ end
 -- upright transform or it reads its own shadow as falling on itself.
 function Voxel3D.draw(mesh, texture, model, pull, sunModel)
   if not (active and mesh) then return end
+  -- OFF SCREEN IS NOT DRAWN.
+  --
+  -- Measured with this frame's own matrix: standing in Lilycove, six
+  -- connected neighbour maps are submitted every frame and all six are
+  -- outside the view -- 3,169,482 quads of terrain against the city's own
+  -- 237,672. On Route 119 it is five of five and 4,730,470 against
+  -- 2,979,507. Nothing had ever asked.
+  --
+  -- Only meshes with a registered box are tested (ChunkMesher stamps the
+  -- map's own footprint on them), so grass, flowers, figures, the battle
+  -- cards, the pokedex and the horde's gun are untouched -- and the current
+  -- map's own mesh always straddles the frustum, so this never removes what
+  -- the player is standing on.
+  --
+  -- ...EXCEPT UNDER THE WORLD CURVE, where it is switched off entirely.
+  -- The bend is a vertex-shader displacement applied AFTER this matrix, and
+  -- it moves geometry DOWN by an amount that grows with distance -- so a
+  -- box tested unbent can sit above the frustum while the geometry inside
+  -- it has been dropped into view. The sun pass has no such problem and
+  -- keeps its cull (see ShadowMap.draw): WorldCurve's own note records that
+  -- the light frustum never moves and the bend carries the shadow with it.
+  if (Voxel3D.curveK or 0) <= 0
+     and MeshBounds.hidden(mesh, Voxel3D.vp, model) then
+    return
+  end
   -- the variant beginScene actually bound, not whichever one is default:
   -- sending a uniform to the other shader would go nowhere
   local sh = activeShader

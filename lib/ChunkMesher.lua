@@ -55,6 +55,26 @@ local Structures = V.require("Structures")
 local TileShape = V.require("TileShape")
 local Voxel3D = V.require("Voxel3D")
 local Budget = V.require("BuildBudget")
+-- Where a finished mesh IS, so the camera and sun passes can decline to
+-- draw one that is off screen. Requires only Mat4, so it cannot close a
+-- cycle with anything here.
+local MeshBounds = V.require("MeshBounds")
+
+-- A map's own footprint, remembered the first time that map is meshed or
+-- loaded, so `swapSlot` further down can stamp it onto whatever mesh lands
+-- -- built here, or restored from the disk cache, it makes no difference.
+-- Keyed by map id and never invalidated, because a map's rectangle is a
+-- property of its layout and cannot change while the game runs.
+--
+-- Declared up HERE, with the requires, rather than beside swapSlot where it
+-- is read: `runGeometry` calls it seventeen hundred lines earlier in the
+-- file, and a local declared after its use site is a nil global.
+local boxById = {}
+local function recordBox(map)
+  local id = map and map.id
+  if not id or boxById[id] ~= nil then return end
+  boxById[id] = MeshBounds.forMap(map) or false
+end
 local Gen3 = V.require("Gen3")
 
 -- Persistent geometry cache. Optional on purpose: a build without the module
@@ -181,20 +201,71 @@ end
 
 local TRI_ORDER = { 1, 2, 3, 1, 3, 4 }
 
+-- ONE BUFFER THAT DOUBLES, OR A LIST OF BLOCKS THAT NEVER MOVE.
+--
+-- The sink used to be a single `float[?]` that doubled whenever it filled:
+-- allocate twice the size, `ffi.copy` everything across, drop the old one.
+-- That is the textbook growable array and it is the wrong shape for this,
+-- because of how big "everything" gets. Route 119 emits 2,979,507 quads --
+-- six unindexed vertices of six floats each -- which is 429 MB of vertex
+-- stream, and reaching it by doubling from 24,576 vertices means ten
+-- reallocations whose copies total ~600 MB, with the LAST of them
+-- allocating 604 MB while the 302 MB it is copying from is still alive.
+--
+-- Measured with a tick-gap profiler over the real emit path (the FFI sink,
+-- not `geometry`'s table sink): that final grow is a SINGLE UNINTERRUPTIBLE
+-- 1,669 ms inside one `push`, which is most of the 4,054 ms worst-case
+-- `ChunkMesher.pump` slice the frame instrumentation reported on arriving
+-- at Route 119. `Budget.tick` cannot help: there is no yield point inside
+-- one `ffi.new` plus one `ffi.copy`.
+--
+-- So the stream is kept as a LIST OF FIXED BLOCKS instead. Nothing is ever
+-- copied to grow, the peak is exactly the stream's own size rather than
+-- 2.1x it, the largest single allocation is one block, and a block
+-- boundary is a natural place to hand the frame back.
+--
+-- THE BYTES ARE IDENTICAL. Same order, same floats, same six-vertex
+-- expansion through TRI_ORDER -- only the container changes -- so `finish`
+-- uploads the same mesh and `writeRaw` writes the same cache file. That is
+-- checked directly: the emitted float stream is hashed before and after.
+--
+-- BLOCK is in VERTICES and MUST be a multiple of 6, or a quad's six
+-- vertices would straddle two blocks and the upload slices would not line
+-- up with the quads. 65,532 = 6 x 10,922, one and a half megabytes, and
+-- within four vertices of the 65,536 the upload already sliced at.
+local BLOCK = 65532
+
 local function newFfiSink()
-  local cap = 4096 * 6
-  local buf = ffi.new("float[?]", cap * 6)
-  local n = 0
+  local blocks = { ffi.new("float[?]", BLOCK * 6) }
+  local nb = 1        -- blocks in use
+  local fill = 0      -- vertices written into blocks[nb]
+  local n = 0         -- vertices in the whole stream
   local sink
+  -- the stream as (block, vertex count) pairs, in order; the last block is
+  -- the only partial one, because push only advances on an exact fill
+  local function eachBlock(fn)
+    for bi = 1, nb do
+      local count = (bi < nb) and BLOCK or fill
+      if count > 0 then fn(blocks[bi], count) end
+    end
+  end
   sink = {
     push = function(c, uv, shade)
-      if n + 6 > cap then
-        local grown = ffi.new("float[?]", cap * 2 * 6)
-        ffi.copy(grown, buf, n * 6 * 4)
-        buf, cap = grown, cap * 2
+      if fill + 6 > BLOCK then
+        nb = nb + 1
+        local nxt = blocks[nb]
+        if nxt == nil then
+          nxt = ffi.new("float[?]", BLOCK * 6)
+          blocks[nb] = nxt
+        end
+        fill = 0
+        -- 1.5 MB of geometry has just been emitted; a frame that wants its
+        -- slice back can have it here
+        Budget.check()
       end
+      local buf = blocks[nb]
       local flat = type(shade) ~= "table"
-      local base = n * 6
+      local base = fill * 6
       for k = 1, 6 do
         local i = TRI_ORDER[k]
         local cc, t = c[i], uv[i]
@@ -206,6 +277,7 @@ local function newFfiSink()
         buf[base + 5] = flat and shade or shade[i]
         base = base + 6
       end
+      fill = fill + 6
       n = n + 6
     end,
     vertexCount = function()
@@ -237,19 +309,15 @@ local function newFfiSink()
         return false, "could not open " .. tostring(path)
       end
       local okWrite, err = pcall(function()
-        local CHUNK = 65536
-        local i = 0
-        while i < n do
-          local count = math.min(CHUNK, n - i)
+        eachBlock(function(buf, count)
           local bytes = count * 6 * 4
           local data = love.data.newByteData(bytes)
-          ffi.copy(data:getFFIPointer(), buf + i * 6, bytes)
+          ffi.copy(data:getFFIPointer(), buf, bytes)
           local wrote = file:write(data:getString())
           if data.release then pcall(data.release, data) end
           if wrote == false then error("short write") end
-          i = i + count
           Budget.check()
-        end
+        end)
       end)
       pcall(file.close, file)
       if not okWrite then
@@ -264,21 +332,20 @@ local function newFfiSink()
       -- is ~10-20MB and one atomic setVertices was the last remaining
       -- frame spike. The mesh is not cached (so never drawn) until the
       -- whole upload lands, and LuaJIT yields fine across pcall.
+      -- One slice per block now, which is what a block is sized for.
       local ok, mesh = pcall(function()
         local m = love.graphics.newMesh(Voxel3D.FORMAT, n,
                                         "triangles", "static")
-        local CHUNK = 65536              -- vertices per slice (~1.5MB)
-        local i = 0
-        while i < n do
-          local count = math.min(CHUNK, n - i)
+        local at = 0
+        eachBlock(function(buf, count)
           local bytes = count * 6 * 4
           local data = love.data.newByteData(bytes)
-          ffi.copy(data:getFFIPointer(), buf + i * 6, bytes)
-          m:setVertices(data, i + 1)
+          ffi.copy(data:getFFIPointer(), buf, bytes)
+          m:setVertices(data, at + 1)
           data:release()
-          i = i + count
+          at = at + count
           Budget.check()
-        end
+        end)
         return m
       end)
       return ok and mesh or nil
@@ -325,6 +392,8 @@ end
 -- Omitted, water stays in the terrain mesh exactly as it always did, which
 -- is what the headless geometry() below and the sun's own pass both want.
 local function runGeometry(map, bodyOnly, masks, sink, waterSink)
+  -- every BUILT mesh passes through here...
+  recordBox(map)
   local push = sink.push
   local waterPush = waterSink and waterSink.push or nil
   local tileset = map.tileset
@@ -2085,10 +2154,21 @@ local function releaseFigures(list)
 end
 
 -- Replace a cached slot, releasing whatever mesh it held.
+--
+-- ...and stamp the new one with where it is. This is the single choke
+-- point every terrain, water, grass and flower mesh passes through on its
+-- way into the cache, which is why the registration lives here rather than
+-- at the four places a mesh is actually made: a mesh that reached the
+-- cache some other way would otherwise draw uncullably forever, and the
+-- failure would be invisible (a frame that is merely slower).
 local function swapSlot(c, slot, mesh)
   local old = c[slot]
   if old and old ~= mesh and old.release then pcall(old.release, old) end
   c[slot] = mesh
+  if mesh and c.id then
+    local box = boxById[c.id]
+    if box then MeshBounds.set(mesh, box) end
+  end
 end
 
 -- ------------------------------------------------------------- the cache
@@ -2096,7 +2176,9 @@ end
 local function entry(id)
   local c = cache[id]
   if not c then
-    c = {}
+    -- `id` on the entry so swapSlot can find the map's box; the cache is
+    -- keyed by it already and nothing else here needed to know
+    c = { id = id }
     cache[id] = c
   end
   return c
@@ -2178,6 +2260,10 @@ end
 -- key does not depend on where the player is standing, and it is what the
 -- prebake writes for the whole map list in one pass.
 local function loadCachedTerrain(job)
+  -- ...and every mesh that comes off the disk cache through here, which is
+  -- the path a map the player has already visited takes and therefore the
+  -- one a cull most needs to cover
+  recordBox(job and job.map)
   if not DiskCache then return nil end
   local okLoad, hit, terrain, water =
     pcall(DiskCache.load, job.map, job.slot, job.masks)

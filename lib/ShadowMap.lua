@@ -28,7 +28,19 @@
 local V = ...
 
 local Mat4 = V.require("Mat4")
+local MeshBounds = V.require("MeshBounds")
 local Voxel = V.require("VoxelState")
+
+-- The PERFORMANCE tier's ceilings (see lib/Tier.lua).  Resolved lazily
+-- rather than at load: Water requires ShadowMap requires Tier, and a
+-- top-level require here would fix an order this module has no business
+-- caring about.  V.require memoises, so this is a hash lookup after the
+-- first frame.
+local Tier_
+local function caps()
+  if not Tier_ then Tier_ = V.require("Tier") end
+  return Tier_.caps()
+end
 
 local ShadowMap = {}
 
@@ -221,6 +233,21 @@ end
 -- where the canvas cannot be made -- VoxelScene then keeps the flat decal
 -- shadows, which need nothing but a quad.
 function ShadowMap.available()
+  -- LOW TAKES THE SUN AWAY, and that is 53% of the frame.
+  --
+  -- Measured with the mod's own instrumentation standing in Petalburg
+  -- Woods with the terrain built and nothing left to mesh: ShadowMap.draw
+  -- was 74.7s of a 139.5s VoxelScene.render and the pass ran on 202 of 202
+  -- rendered frames, because `shadowSignature` correctly says the map is
+  -- stale the moment any caster moves and an NPC's walk phase moves every
+  -- frame.  So the whole terrain mesh is re-rendered from the light sixty
+  -- times a second to follow somebody's footsteps.
+  --
+  -- Answering false here is not a new mode: VoxelScene already has a
+  -- shadow path for a driver that cannot make the canvas (the flat decals
+  -- under each character), it is the path this mod shipped before the sun
+  -- pass existed, and it costs one quad per person.
+  if not caps().shadows then return false end
   if love.system and love.system.getOS and love.system.getOS() == "iOS" then
     return false
   end
@@ -237,12 +264,21 @@ end
 -- has a shader at all, because an unbound sampler is a driver-dependent
 -- crash rather than a driver-dependent fallback.
 function ShadowMap.texture()
+  -- The blank stand-in is "everything is lit", which is what the fallback
+  -- decal path wants; never nil, because an unbound sampler is a
+  -- driver-dependent crash rather than a driver-dependent fallback.
+  if not caps().shadows then return getBlank() end
   if ready and canvas then return canvas end
   return getBlank()
 end
 
 -- True while the map holds a frame the main pass can read.
 function ShadowMap.active()
+  -- ...and the same answer here, so a tier lowered mid-session does not
+  -- leave the main pass sampling the last frame the sun drew.  `ready`
+  -- is left alone on purpose: raise the tier again and the very next
+  -- staleness test redraws the map, with no canvas reallocated.
+  if not caps().shadows then return false end
   return ready and canvas ~= nil and canvas ~= false
 end
 
@@ -337,6 +373,16 @@ local function fit(cx, cy, vw, vh)
       break
     end
   end
+  -- BALANCED stops the ladder at its bottom rung.  The pass is fill-bound
+  -- (it rasterises the whole terrain mesh into the map), so 1024 against
+  -- 2048 is a quarter of the texels and a quarter of the fill on every sun
+  -- pass.  What it costs is the SOFTNESS of the edge: TARGET says 0.45
+  -- world pixels per texel is worth paying for, and a map clamped one rung
+  -- down lands between 0.45 and 0.9 of a world pixel, which on a diorama
+  -- read at this zoom is most of one display pixel of blur along a shadow
+  -- rim.  nil at HIGH, where this loop is exactly what it always was.
+  local resCap = caps().shadowRes
+  if resCap and res > resCap then res = resCap end
   ShadowMap.res = res
 
   -- the box's SIZE is fixed (the sun and the view size are), so snapping
@@ -481,6 +527,16 @@ end
 
 function ShadowMap.draw(mesh, texture, model)
   if not (drawing and mesh) then return end
+  -- The same cull as the camera pass, against the LIGHT's clip matrix --
+  -- the one this pass' own shader is transforming by, so a mesh outside it
+  -- could not have written a texel. The sun's box is fitted to the view
+  -- (ShadowMap.fit), so the neighbours that are off camera are off the
+  -- light's box too and this saves the same meshes a second time in the
+  -- same frame.
+  --
+  -- No curve exception here, unlike Voxel3D.draw: the sun records the world
+  -- FLAT and the bend is applied afterwards to the lit pass alone.
+  if MeshBounds.hidden(mesh, ShadowMap.clipVP, model) then return end
   local sh = getShader()
   if texture then mesh:setTexture(texture) end
   pcall(sh.send, sh, "model", "row", model or IDENTITY)

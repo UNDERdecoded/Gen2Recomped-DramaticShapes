@@ -428,6 +428,52 @@ function OverworldBattle.opaqueWindows(battle)
   return OverworldBattle.geometry(battle).opaqueWindows and true or false
 end
 
+-- ------- HOW SOLID THE PANELS ARE OVER THE ARENA
+--
+-- IN-GAME, the user's words: "the ui needs some work so its not obscuring the
+-- battlefield in 3d battles."
+--
+-- MEASURED, at six window sizes from 1280x720 to 2560x1440 (the arena's ground
+-- footprint projected through the real rig, against the rects snapRects and
+-- snapHUDs actually place): the UI covers 25.5% to 37.0% of the visible arena
+-- floor, of which the two status panels are about two thirds and the message
+-- strip the rest -- and the FOE's panel, which covers none of the floor at all,
+-- covers 17% to 31% of the PLAYER'S OWN CARD.
+--
+-- GIVING THE DIORAMA MORE ROOM CANNOT FIX IT, and that is arithmetic rather than
+-- an opinion: the clear band between the foe panel's bottom edge and the message
+-- strip's top edge runs 320..720 px across those six sizes, and the taller of
+-- the two cards runs 395..888 px. At EVERY size the card is 75 to 168 pixels
+-- taller than the only gap there is to put it in. There is no framing of this
+-- arena that stands both mons clear of both blocks.
+--
+-- So the panels let the arena through instead. This is alpha on the bands the
+-- mod composites ITSELF -- not the frosted glass (`opaqueWindows` keeps that
+-- off: glass behind an opaque cartridge sprite is invisible work) and above all
+-- NOT the ink flip, which is the thing that failed before by painting white
+-- glyphs onto cream. Alpha multiplies panel and ink together, so the DIFFERENCE
+-- between them survives in proportion, which is exactly what readability is.
+--
+-- WHERE THE NUMBER COMES FROM. WCAG contrast between the darkest glyph pixel in
+-- the reported frame (36,61,11) and the panel cream (255,255,222), composited
+-- over 350 background samples taken across a real diorama battle frame:
+--
+--     alpha  1.00   0.90   0.80   0.70   0.60   0.50
+--     worst 11.80   9.47   7.52   5.93   4.65   3.62      (AA is 4.5)
+--
+-- The break is between 0.60 and 0.50 -- every sample passes at 0.60 and none at
+-- 0.50 -- so the failure point is 0.6 and this is the midpoint of that and
+-- opaque: a fifth of the arena shows through and the worst case still stands 67%
+-- clear of AA. It is one number and the only one; 0.70 is available and proved
+-- if more of the floor is wanted.
+--
+-- GEN 1, GEN 2 AND PRISM ARE UNTOUCHED BY CONSTRUCTION. This is gated on
+-- `opaqueWindows`, which a layout that draws its windows as its own sprites
+-- publishes and the Game Boy layouts do not -- their panels are frosted glass
+-- the player can already see through, and there is no cartridge sprite to make
+-- translucent. No flag, alpha 1, and the blit below is the identical call.
+OverworldBattle.PANEL_ALPHA = 0.80
+
 -- ------- WHERE THE TWO BANDS ARE CUT
 --
 -- snapHUDs blits the HUD layer as TWO horizontal bands at TWO DIFFERENT x
@@ -466,13 +512,185 @@ end
 -- puts at row 58) by six rows.
 OverworldBattle.BAND_CLEARANCE = 8      -- one tile row
 
-function OverworldBattle.bands(geom)
+-- ------- HOW FAR THE PLAYER'S PANEL DROPS
+--
+-- IN-GAME: "can we lower the players pokemon hud box to right above the
+-- textbox?"  On the Game Boy's screen it already is -- its player block runs
+-- to row 96 and the text box starts at row 96 -- but Emerald's field is taller
+-- than its furniture and leaves a band of empty screen between the two, which
+-- in the diorama is a band of ARENA the panel is standing in the middle of
+-- (measured in g3-ringside-284: the player's panel alone covers 14-24% of the
+-- visible arena floor).
+--
+-- DERIVED, not chosen.  The drop is whatever room the layout itself leaves
+-- between the bottom of the player's published block and the top of its
+-- published message strip, less the one tile row BAND_CLEARANCE already
+-- justifies as the granularity these boxes are composed in.  No new constant.
+--
+-- GEN 1, GEN 2 AND PRISM GET ZERO BY CONSTRUCTION: their player block ends at
+-- row 96 and their box starts at row 96, so the room is 0 - 8 = -8, the test
+-- fails and the drop is 0.  One branch, no layout check, nothing moves.
+--
+-- SINGLES ONLY.  A double battle has four healthboxes at four places and the
+-- layout still publishes the SINGLES pair (Gen3Battle.geometry asks hudPlace
+-- for "singlesPlayer"), so a drop derived from the singles block would move
+-- all of the lower band's boxes by a number computed for one of them.  The
+-- mod does not stage doubles at all yet (see the notes); this refuses to make
+-- their HUD worse in the meantime.
+function OverworldBattle.hudDrop(battle, geom)
+  if battle and type(battle.isDouble) == "function" then
+    local okD, double = pcall(battle.isDouble, battle)
+    if okD and double then return 0 end
+  end
+  local r = geom and geom.hudRect and geom.hudRect.player
+  local t = geom and geom.textRect and geom.textRect.box
+  if not (r and t) then return 0 end
+  local room = t[2] - (r[2] + r[4]) - OverworldBattle.BAND_CLEARANCE
+  if not (room > 0) then return 0 end
+  return math.floor(room)
+end
+
+-- ------- THE FOUR BOXES A DOUBLE BATTLE ACTUALLY DRAWS
+--
+-- IN-GAME: "The battle ui is still glitched and pieces of it are ending up
+-- in the middle of the screen."
+--
+-- bands() below cuts the HUD layer in two using the published hudRect pair,
+-- and on a Gen 3 cache that pair is the SINGLE-battle boxes: Gen3Battle
+-- .geometry asks hudPlace for "singlesPlayer" / "singlesOpponent" and for
+-- nothing else, on every layout. A double battle draws four boxes somewhere
+-- else entirely, so the cut is computed for furniture that is not on screen.
+--
+-- THIS IS A DATA READ, NOT A PUBLISHED CONTRACT. BattleState:layoutGeometry
+-- is a seam the engine added for this mod and is versioned with it; these two
+-- tables are the DATASET's, imported from the cartridge by RomExtractorGen3,
+-- and the engine happens to read them in the same place
+-- (Gen3Battle.drawHUDs). They can be absent or old -- the harness this was
+-- written on had no gen3BattlerCoords key at all until the real file was
+-- staged, and a cache imported before the stage existed still will not. So
+-- every field is checked before it is trusted and ANY gap returns nil, which
+-- puts bands() back on exactly the path it takes today.
+--
+-- The four slots, and which art each wears, are drawHUDs' own table
+-- (src/battle/Gen3Battle.lua:1043-1050) -- including the one that matters:
+-- the player's LEFT box wears `images.player`, the 64-tall panel with the
+-- EXP bar, while the other three wear 32-tall ones.
+local DOUBLES_BOXES = {
+  { key = "playerLeft",    side = "player", art = "player" },
+  { key = "playerRight",   side = "player", art = "playerDoubles",
+                                            alt  = "player" },
+  { key = "opponentLeft",  side = "enemy",  art = "opponent" },
+  { key = "opponentRight", side = "enemy",  art = "opponentDoubles",
+                                            alt  = "opponent" },
+}
+
+local function num(v)
+  v = tonumber(v)
+  return (v and v == v) and v or nil          -- and not a NaN
+end
+
+function OverworldBattle.hudBoxes(battle)
+  if not battle then return nil end
+  if type(battle.isDouble) ~= "function" then return nil end
+  local okD, double = pcall(battle.isDouble, battle)
+  if not (okD and double) then return nil end
+  local c = battle.data and battle.data.constants
+  local coords = c and c.gen3BattlerCoords
+  local hb = coords and coords.healthbox
+  local hud = c and c.gen3BattleHud
+  if type(hb) ~= "table" or type(hud) ~= "table" then return nil end
+  local geo = type(hud.geometry) == "table" and hud.geometry or {}
+  local imgs = type(hud.images) == "table" and hud.images or {}
+  -- ...and the heights, from the same record the drawing reads them from.
+  -- geometry states the two single-battle panels outright; the two DOUBLES
+  -- panels are the generic box, which is what boxHeight is. Each falls back
+  -- to the next, and the last falls back to 32 -- the value
+  -- Gen3Battle.HUD_PLACE_FALLBACK has always used.
+  local function heightOf(art)
+    local g = (art == "opponent" and geo.opponent)
+              or (art == "player" and geo.player) or nil
+    return num(g and g.height) or num(hud.boxHeight) or 32
+  end
+  local w = num(hud.boxWidth) or num(geo.opponent and geo.opponent.width) or 128
+  local out = {}
+  for _, slot in ipairs(DOUBLES_BOXES) do
+    local pos = hb[slot.key]
+    local x, y = num(pos and pos.x), num(pos and pos.y)
+    if not (x and y) then return nil end       -- a partial table is no table
+    -- the art the engine would pick: `images.opponentDoubles or
+    -- images.opponent`, and the same for the player's pair
+    local art = (imgs[slot.art] and slot.art) or slot.alt or slot.art
+    local h = heightOf(art)
+    -- the corner hudPlace states for a centre: half of the FIRST of the two
+    -- 64-wide sprites off the x, half the panel off the y
+    local top = y - math.floor(h / 2)
+    out[#out + 1] = { side = slot.side, key = slot.key, art = art,
+                      x = x - 32, y = top, w = w, h = h,
+                      top = top, bottom = top + h }
+  end
+  if #out ~= #DOUBLES_BOXES then return nil end
+  return out
+end
+
+function OverworldBattle.bands(geom, battle)
   local band, rect = geom.hudBand, geom.hudRect
   local e, p = band.enemy, band.player
   -- only the shape this function understands: two full-width bands meeting on
   -- one row. Anything else is handed back untouched rather than guessed at.
   if e[2] + e[4] ~= p[2] then return band end
   local cut = p[2]
+
+  -- ------- AND IN A DOUBLE THERE IS NO SAFE ROW AT ALL
+  --
+  -- Measured off the staged constants (probe:
+  -- /tmp/agent43/doublebox_probe.lua), the four boxes a double draws are
+  --
+  --     playerLeft     player           h=64  rows  44..108  (player band)
+  --     playerRight    playerDoubles    h=32  rows  85..117  (player band)
+  --     opponentLeft   opponent         h=32  rows   3.. 35  (enemy band)
+  --     opponentRight  opponentDoubles  h=32  rows  28.. 60  (enemy band)
+  --
+  -- The lowest thing in the FOE's band ends at row 60 and the highest thing
+  -- in the PLAYER's begins at row 44, because the player's left-hand panel
+  -- is the tall one with the EXP bar. The window a cut would have to live in
+  -- is [60, 44]: EMPTY. Today's cut lands at 51 and tears BOTH of them --
+  -- opponentRight's bottom thrown right, playerLeft's top thrown left, which
+  -- is the two staggered strips in the reported frame.
+  --
+  -- So the cut is not moved, it is GIVEN UP: one band, the whole layer, blitted
+  -- where the engine drew it. One draw call cannot tear -- the same argument
+  -- that identified this family of bug in the first place (see BAND_CLEARANCE
+  -- above: "the engine draws that box with ONE love.graphics.draw call and one
+  -- call cannot tear"). Nothing in the layer is dropped, every box lands in its
+  -- own place, and the panel alpha still applies. What is given up is the edge
+  -- SNAP for doubles, which is the price of a layout with no safe cut; getting
+  -- it back means a quad per BOX rather than per band, which is a bigger round.
+  --
+  -- Kept as a derivation rather than "doubles: don't snap", because a layout
+  -- whose four boxes DO leave a gap should still get the snap: when the window
+  -- is non-empty the published cut is used if it fits in it, and otherwise the
+  -- nearest row that does.
+  local boxes = OverworldBattle.hudBoxes(battle)
+  if boxes then
+    local eb, pt = nil, nil
+    for _, b in ipairs(boxes) do
+      if b.side == "enemy" then eb = math.max(eb or b.bottom, b.bottom)
+      else pt = math.min(pt or b.top, b.top) end
+    end
+    if eb and pt then
+      if pt >= eb then
+        local row = math.max(eb, math.min(pt, cut))
+        if row == cut then return band end
+        return {
+          enemy  = { e[1], e[2], e[3], row - e[2] },
+          player = { p[1], row, p[3], (p[2] + p[4]) - row },
+        }
+      end
+      -- no row separates them: the layer goes down whole, in the letterbox
+      return { full = { 0, 0, geom.width, geom.height } }
+    end
+  end
+
   local eb = rect.enemy[2] + rect.enemy[4]     -- where the foe's block ends
   local pt = rect.player[2]                    -- where the player's begins
   if not (pt > eb) then return band end        -- blocks overlap: no cut is safe
@@ -484,6 +702,100 @@ function OverworldBattle.bands(geom)
     enemy  = { e[1], e[2], e[3], mid - e[2] },
     player = { p[1], mid, p[3], (p[2] + p[4]) - mid },
   }
+end
+
+-- ------- AND IN A DOUBLE, EACH SIDE'S BOXES GO OUT TO ITS OWN WINDOW EDGE
+--
+-- IN-GAME: "move the pokemon hud boxes to the edges of the screen".
+--
+-- SINGLES ALREADY DOES. snapRects below puts the foe's panel's left edge at
+-- world-canvas x = 0 and the player's right edge at shot.pw, and those two are
+-- the window's own edges -- that is what the snap has been since
+-- g3-viewport-254. The frame the request came with is a DOUBLE, and a double is
+-- inset because g3-lens-292 put it there: it measured that the four healthboxes
+-- leave no safe horizontal cut (the player's left box is the 64-tall panel with
+-- the EXP bar, rows 44..108, straight through the foe's right box at 28..60) and
+-- gave the snap up rather than tear two boxes in half.
+--
+-- A horizontal MOVE is not a cut, so the snap comes back the way that entry said
+-- it would have to: a quad per BOX. hudBoxes already reports the four rects and
+-- which band each belongs to, so each is blitted on its own and nothing is ever
+-- sliced.
+--
+-- WHAT GOES ON THE EDGE IS THE SURFACE'S EDGE, not the box's, so each side keeps
+-- the stagger the cartridge gave it. The foe's pair sit flush with surface x = 0
+-- (opponentRight's own left edge is 0), so surface 0 goes to the window's left.
+-- The player's pair hang OFF surface x = 240 by design -- playerLeft runs to 255
+-- and playerRight to 267, clipped by the cartridge's own screen -- so surface
+-- 240 goes to the window's right and they hang off the window instead, which is
+-- the same picture one screen wider.
+--
+-- ONLY ONCE THE PANELS ARE UP. Before that the layer is carrying the party-ball
+-- summary (Gen3Battle.drawIntroBalls), which is not a box, and cutting four
+-- box-shaped quads out of the layer would throw the balls away. The guards are
+-- drawHUDs' own -- `enemyReady` and `playerReady`, its two readiness tests --
+-- and when they do not hold this answers nil and the whole-layer blit that
+-- ships today is used unchanged.
+--
+-- hudDrop does not interact: it returns 0 for a double by construction (see
+-- its own note), so there is no second displacement to compose with.
+function OverworldBattle.hudEdgeQuads(battle, geom, shot)
+  local boxes = OverworldBattle.hudBoxes(battle)
+  if not boxes then return nil end
+  -- Gen3Battle.drawHUDs:1116-1119, mirrored: the foe's panels wait on the
+  -- trainer, the send-out and the intro balls, and the player's on the back pic
+  if battle.showEnemyTrainer or battle.enemySendingOut or battle.introBalls
+     or battle.showPlayerBack then
+    return nil
+  end
+  local s = shot.scale
+  local W, H = geom.width, geom.height
+  if not (s and s > 0 and W and H) then return nil end
+  local right = shot.pw - W * s
+  local out = {}
+  for _, b in ipairs(boxes) do
+    -- one pixel of margin, so the target highlight's outline rides with the box
+    -- it is drawn around -- drawHUDs puts it at (px - 1, py - 1), 66 x h + 2
+    local x, y, w, h = b.x - 1, b.y - 1, b.w + 2, b.h + 2
+    -- ------- AND NO SOURCE COLUMN IS EVER BLITTED TWICE
+    --
+    -- The two sides' boxes OVERLAP in columns: the foe's right-hand box runs
+    -- to 128 and the player's left-hand one begins at 127, and they share rows
+    -- 44..60. Blitting both quads whole would carry those two columns to the
+    -- LEFT edge inside one quad and to the RIGHT edge inside the other -- the
+    -- same pixels in two places, which is a ghost of exactly the kind the band
+    -- cut was given up to avoid.
+    --
+    -- The overlap belongs to the FOE, and that is the engine's own answer
+    -- rather than a choice made here: drawHUDs' table is ordered playerLeft,
+    -- playerRight, opponentLeft, opponentRight (Gen3Battle.lua:1043-1050), so
+    -- every opponent panel is drawn after every player one and its art is what
+    -- is actually sitting in those columns of the layer.
+    --
+    -- Only against boxes that share ROWS with this one, so nothing is clipped
+    -- for an overlap that is not really there: the foe's left box and the
+    -- player's left box share columns 12..140 and no row at all.
+    -- clipped past the foe quad's INFLATED edge, because that is the rect that
+    -- is actually blitted -- the margin above is part of it
+    if b.side == "player" then
+      for _, o in ipairs(boxes) do
+        if o.side == "enemy"
+           and (o.top - 1) < (y + h) and (o.bottom + 1) > y then
+          local edge = o.x + o.w + 1
+          if edge > x then w = w - (edge - x); x = edge end
+        end
+      end
+    end
+    if x < 0 then w = w + x; x = 0 end
+    if y < 0 then h = h + y; y = 0 end
+    if x + w > W then w = W - x end
+    if y + h > H then h = H - y end
+    if w > 0 and h > 0 then
+      out[#out + 1] = { x, y, w, h, ox = (b.side == "enemy") and 0 or right }
+    end
+  end
+  if #out == 0 then return nil end
+  return out
 end
 
 -- ------- where each block lands (unchanged in shape; the rects it cuts are
@@ -498,7 +810,13 @@ function OverworldBattle.snapRects(shot, battle)
     enemy = { ex + e[1] * s, shot.ly + e[2] * s, e[3] * s, e[4] * s },
     player = { px + p[1] * s, shot.ly + p[2] * s, p[3] * s, p[4] * s },
   }
-  return rects, { enemy = ex, player = px }
+  -- ...and where a band that is NOT snapped to an edge goes: the letterbox's
+  -- own left, which is where toWorld puts the text box's glass and where the
+  -- engine drew the layer in the first place. Only OverworldBattle.bands' `full`
+  -- band ever asks for it (a double battle, whose four healthboxes leave no row
+  -- to cut on), so on every other frame and every other layout this key is
+  -- never read.
+  return rects, { enemy = ex, player = px, full = shot.lx }
 end
 
 -- A rect measured in the GB frame, in WORLD-canvas pixels: where the letterbox
@@ -517,6 +835,83 @@ end
 -- nil when no overworld battle is running. Never more than one: battles do
 -- not nest.
 local session = nil
+
+-- The last composition reported, so the line below prints on a change and not
+-- sixty times a second -- the same idiom the pic placement already uses (see
+-- placeLog in sideTexture, and shadowSignature, which it was built from).
+local camLog = nil
+
+-- ------- WHAT THE SHOT IS ACTUALLY COMPOSED OF, IN THE UNITS OF THE COMPLAINT
+--
+-- IN-GAME: "i dont like that zooming out seems to make the pokemon bigger they
+-- should get smaller than their normal size during zooming out", and then
+-- "Back sprites isnt on when i zoom out they stay pretty much the same size or
+-- get bigger".
+--
+-- Two rounds went into whether the CARD grows, and it cannot: monMatrix has no
+-- camera term in it, and measured in pixels a full mon goes 375 -> 188 across
+-- the zoom-out range while a map tile goes 375 -> 188 with it. What the
+-- measurement did turn up is that a Pokemon's apparent size is not driven by
+-- one control but by TWO, and they multiply:
+--
+--     BattleCam.frameH = base * zoom * spread(arena)
+--
+-- `zoom` is the wheel. `spread` is the ORBIT and the PITCH -- the stick, the
+-- drag, the mouse -- and it exists to stop the pair flying off the edges when
+-- the shot swings to side-on (see BattleCam.spread). Over its range it moves
+-- the frame by 1.94x. The whole zoom-out range moves it by 2.00x. So steering
+-- home while pulling out cancels the pull, and steering home faster reverses
+-- it -- which is the report, both halves of it, in order.
+--
+-- Neither control is changed by this. What was missing was any way to tell
+-- the two apart from outside, so the composition says what it is: the two
+-- inputs, the frame they produce in TILES, and how much of the frame a
+-- full-size Pokemon fills. A frame that comes out wrong names its own cause,
+-- which is the rule the rest of this file already follows.
+--
+-- Reported on the GOALS rather than the eased values, so it is one line per
+-- input event and silent while nothing is being touched. The goals are read
+-- into the live fields for the length of one pure call and put straight back;
+-- BattleCam.spread reads exactly those two fields and nothing else.
+function OverworldBattle.shotLine(arena)
+  local BC = BattleCam
+  local o, p = BC.orbit, BC.pitch
+  BC.orbit, BC.pitch = BC.orbitGoal, BC.pitchGoal
+  local okS, spread = pcall(BC.spread, arena)
+  BC.orbit, BC.pitch = o, p
+  if not (okS and type(spread) == "number") then return nil end
+  local base = BC.rigFor(arena).frameH
+  local frame = (BC.still or not BC.steerable) and base
+                or base * BC.zoomGoal * spread
+  if not (frame and frame > 0) then return nil end
+  -- CELL is BattleArena's own 16, and FULL_W is the world width a full 7x7
+  -- mon stands at -- also 16, which is the whole point of that constant: one
+  -- mon, one tile. Named here rather than assumed, because the two being
+  -- equal is what made g3-lens-292's card/tile ratio vacuous.
+  local CELL = 16
+  local okB, BB = pcall(V.require, "BattleBillboard")
+  local MON = (okB and BB and tonumber(BB.FULL_W)) or 16
+  -- ...AND WHETHER THERE ARE ANY CARDS TO BE THAT SIZE.
+  --
+  -- The whole of g3-scale-295 was four rounds of measuring how big a billboard
+  -- ought to be while there was no billboard on screen. The one fact that
+  -- would have ended it on the first round is whether `textures` produced
+  -- anything, and nothing said. It says now, on the line that is already being
+  -- printed, so the next frame anyone doubts can be settled by reading it.
+  local tex = session and session.textures
+  local cards = ("cards enemy=%s player=%s")
+                :format((tex and tex.enemy) and "yes" or "NO",
+                        (tex and tex.player) and "yes" or "NO")
+  return ("rig %s  zoom %.2f of %.2f..%.2f  orbit %.2f  pitch %.2f  "
+          .. "spread %.2f  frame %.1f world px = %.2f tiles  "
+          .. "a full mon fills %.1f%% of it  " .. cards)
+         :format(tostring(arena and arena.cam or BattleCam.DEFAULT_RIG),
+                 -- the LIVE stop, which is this rig's own (BattleCam.zoomMax)
+                 -- and not the default rig's published number
+                 BC.zoomGoal, BC.ZOOM_MIN, BC.zoomMax(arena and arena.cam),
+                 BC.orbitGoal, BC.pitchGoal, spread,
+                 frame, frame / CELL, 100 * MON / frame)
+end
 
 local function isIOS()
   return love.system and love.system.getOS and love.system.getOS() == "iOS"
@@ -623,6 +1018,17 @@ function OverworldBattle.begin(state, battle)
               armed = false, token = "-" }
   cullCast(state)
   BattleCam.reset()
+  -- The composition is new to this battle, so its first line should be printed
+  -- rather than suppressed as a repeat of the last fight's.
+  --
+  -- NOT because the steer resets: it does NOT. BattleCam.reset only zeroes the
+  -- drift's phase, and BattleCam.recentre -- the one that puts zoom, orbit and
+  -- pitch back -- has no caller. The steer is session state on purpose ("a
+  -- fresh run opens on the rig's own shot"), so a player who pulled the lens
+  -- out last fight is still pulled out in this one. g3-parallax-293's note here
+  -- said the opposite and was wrong; it is also why BattleCam.update has to
+  -- bring a carried zoom back inside a tighter rig's stop.
+  camLog = nil
   return true
 end
 
@@ -714,6 +1120,21 @@ function OverworldBattle.update(dt)
   -- turn it into travel (CamControl, which owns every one of those inputs)
   pcall(V.require("CamControl").tick, dt)
   BattleCam.update(dt)
+  -- ...and the shot says what it is composed of, once per input (see
+  -- OverworldBattle.shotLine). Keyed on the string, so a battle nobody is
+  -- steering prints one line and then nothing. It draws nothing at all: every
+  -- layout's frame is untouched, byte for byte.
+  -- ...and the WHOLE of it inside the pcall, the log call included. It sits
+  -- ahead of the texture build below, so anything it can raise would take the
+  -- billboards down with it -- which is the exact failure this round was spent
+  -- diagnosing, and a diagnostic must not be able to cause it.
+  pcall(function()
+    local line = OverworldBattle.shotLine(session.arena)
+    if line and line ~= camLog then
+      camLog = line
+      V.mod.log:info("overworld battle camera: %s", line)
+    end
+  end)
   -- the battle only exists once it has been pushed; a session opened at
   -- pushBattle time has it, one opened from battle.started was handed it
   session.battle = session.battle or (top ~= ow and top or nil)
@@ -1176,6 +1597,51 @@ OverworldBattle.sideVisible = BattleVisibility.sideVisible
 -- for this side?" about a side that ended up with no billboard.
 OverworldBattle.sideVisible = sideVisible
 
+-- ------- AND IN A DOUBLE, A SIDE IS ALSO ITS RIGHT-HAND FLANK
+--
+-- Everything above asks about `battle.enemy` and `battle.player`, which are
+-- the LEFT flanks and only the left flanks: placeBattler keeps the old names
+-- for flank 1 and puts flank 2 in `sides[n].battlers[2]` alone
+-- (src/battle/BattleState.lua:2726). So in a double whose left Pokemon has
+-- fainted -- or has not been sent out yet -- the SURVIVING right-hand one has
+-- no billboard at all: the engine draws it into the canvas perfectly well and
+-- the mod never asks for the canvas.
+--
+-- The guards are drawPicsLayer's own, for the same battler, read off its
+-- doubles loop (src/battle/BattleState.lua:9724-9740): a sprite, not
+-- fx-hidden, and its side not still arriving. The slide is 0 because that is
+-- what sideTexture renders at.
+--
+-- ADDITIVE AND DOUBLES-ONLY. It can only turn a false into a true, never the
+-- reverse, and it returns false immediately unless BattleState:isDouble() is
+-- true -- which is `self.double == true and BattleState.DOUBLES_READY == true`
+-- (:2701). A single battle never sets `double`, and Gen 1, Gen 2 and Prism
+-- have no double battles at all, so neither can reach past the first line.
+local leftFlankVisible = sideVisible
+sideVisible = function(battle, side)
+  if leftFlankVisible(battle, side) then return true end
+  if type(battle.isDouble) ~= "function" then return false end
+  local okD, double = pcall(battle.isDouble, battle)
+  if not (okD and double) then return false end
+  -- POS resolves through the instance's metatable (BattleState.__index =
+  -- BattleState, :50); the literals are the published values (:2683) and are
+  -- there so a future refactor degrades to today's behaviour, not a crash.
+  local POS = battle.POS or {}
+  local pos = (side == "enemy") and (POS.OPPONENT_RIGHT or 3)
+                                or (POS.PLAYER_RIGHT or 2)
+  local okB, b = pcall(battle.battlerAt, battle, pos)
+  if not (okB and b and b.sprite) then return false end
+  local okH, hidden = pcall(battle.fxHidden, battle, b)
+  if not okH or hidden then return false end
+  local okA, arriving = pcall(battle.sideArriving, battle, b.isPlayer, 0)
+  if not okA or arriving then return false end
+  return true
+end
+-- ...and the published name is the wrapper, so flatFallback asks the same
+-- question sideTexture does. Re-stated rather than moved, so the line above
+-- stays where every earlier note points at it.
+OverworldBattle.sideVisible = sideVisible
+
 local OFF = {
   enemy = { player = false, showPlayerBack = false },
   player = { enemy = false, showEnemyTrainer = false },
@@ -1271,11 +1737,85 @@ function OverworldBattle.sideTexture(battle, side)
     local r, gg, b, a = realGetColor()
     put(r); put(gg); put(b); put(a)
     for i = 1, select("#", ...) do put((select(i, ...))) end
-    local a1, a2, a3 = ...
-    if type(a1) == "number" and type(a2) == "number" and a3 == nil
+    -- THE ARGUMENTS THE RECORDER BELOW READS.
+    --
+    -- This line is not decoration. g3-quartet-290's replacement began at it
+    -- and did not put it back, so `a1` .. `a6` became GLOBALS -- nil, always
+    -- -- `type(ax1) == "number"` failed on every draw, `drawnAt[side]` was
+    -- never written, and the anchor fell back to TEX_AX / TEX_AY for every
+    -- pose. Both of g3-perch-288's and g3-quartet-290's readings of where the
+    -- engine actually put the pic have been inert since.
+    --
+    -- Proved rather than asserted: the hook was lifted verbatim into a
+    -- harness whose environment records global reads, and it reported
+    -- `a1x6 a2x3 a3x3 a4x3 a5x3` with drawnAt NIL for all three draw shapes.
+    local a1, a2, a3, a4, a5, a6 = ...
+    -- Two shapes, because the layer draws in two: the trainer pic goes down
+    -- bare, `draw(img, x, y)`, and a Pokemon goes through drawBattlerPic ->
+    -- drawMonAnimated as `draw(img, x, y, 0, scale, scale)`. Both are an
+    -- upright, unrotated, uniformly-scaled blit and both give a rect outright.
+    -- Anything else -- a quad, a rotation, an origin offset, a non-uniform
+    -- scale -- is left alone rather than half-understood, and then the
+    -- assumed anchor still covers it.
+    -- FOUR SHAPES, BECAUSE AN ANIMATING POKEMON IS NOT DRAWN LIKE A STILL ONE.
+    --
+    -- IN-GAME: "its still playing its battle sprite animation and faint
+    -- animation in the weird position it was in before; after playing the
+    -- intro animation it goes into the proper spot."
+    --
+    -- g3-perch-288 made the card hang off where the engine actually put the
+    -- pic, read here -- but it only understood the two PLAIN blits:
+    --
+    --     the trainer   draw(img, x, y)
+    --     a still mon   draw(img, x, y, 0, s, s)
+    --
+    -- An animating one goes down through neither:
+    --
+    --     drawMonAnimated  draw(img, cx, cy, rot, s*sx, s*sy, w/2, h)
+    --     the faint slide  draw(img, quad, x, y + off, 0, scale, scale)
+    --
+    -- so for exactly as long as an animation ran, nothing was recorded, the
+    -- anchor fell back to TEX_AX / TEX_AY -- the old pin g3-perch-288 exists
+    -- to stop using -- and the card snapped into place the instant the
+    -- animation ended.  That is the report, word for word.
+    --
+    -- All four reduce to ONE question: where is the pic's frame bottom-centre.
+    -- The origin form answers it outright whatever the rotation, because
+    -- drawMonAnimated's origin IS the bottom-centre (w/2, h), so the drawn
+    -- point (x, y) is the anchor and the rotation turns about it.  The quad
+    -- form answers it off the viewport, which is what makes the faint's
+    -- sinking foot follow the slide instead of jumping back to the slot.
+    --
+    -- Recorded as the equivalent axis-aligned rect so every reader downstream
+    -- -- including the trainer's 56x56 test -- is unchanged.
+    local q, ax1, ay1, rot, asx, asy, aox, aoy
+    if type(a1) == "userdata" and a1.getViewport then
+      q, ax1, ay1, rot, asx, asy = a1, a2, a3, a4, a5, a6
+    else
+      ax1, ay1, rot, asx, asy = a1, a2, a3, a4, a5
+      aox, aoy = select(6, ...), select(7, ...)
+    end
+    if type(ax1) == "number" and type(ay1) == "number"
        and type(drawable) == "userdata" and drawable.getDimensions then
+      rot = tonumber(rot) or 0
+      local sx = tonumber(asx) or 1
+      local sy = tonumber(asy) or sx
       local okD, dw, dh = pcall(drawable.getDimensions, drawable)
-      if okD and dw and dh then drawnAt[side] = { a1, a2, dw, dh } end
+      if q then
+        local okQ, _, _, qw, qh = pcall(q.getViewport, q)
+        if okQ and qw and qh then dw, dh = qw, qh else okD = false end
+      end
+      if okD and dw and dh and dw > 0 and dh > 0 and sx ~= 0 and sy ~= 0 then
+        -- the frame's bottom-centre, in origin space, taken to where it landed
+        local ox = tonumber(aox) or 0
+        local oy = tonumber(aoy) or 0
+        local dx, dy = (dw / 2 - ox) * sx, (dh - oy) * sy
+        local c, s = math.cos(rot), math.sin(rot)
+        local bcx = ax1 + dx * c - dy * s
+        local bcy = ay1 + dx * s + dy * c
+        local w, h = math.abs(dw * sx), math.abs(dh * sy)
+        drawnAt[side] = { bcx - w / 2, bcy - h, w, h, math.abs(sy) }
+      end
     end
     return realDraw(drawable, ...)
   end
@@ -1291,7 +1831,74 @@ function OverworldBattle.sideTexture(battle, side)
     g.clear(0, 0, 0, 0)
     g.setBlendMode("alpha")
     g.setColor(1, 1, 1, 1)
-    innerPics(battle, 0, 0, 0)
+    -- ------- AND THE LAYER IS TOLD WHICH SIDE IT IS RENDERING
+    --
+    -- IN-GAME: "theres a duplicate of my pokemon on their side now."
+    --
+    -- The fourth argument is drawPicsLayer's `onlySide`, and this passed the
+    -- NUMBER ZERO -- which is not "player", is not "enemy", and is therefore
+    -- not equal to anything the layer tests it against. Four of the layer's
+    -- five guards were then carried entirely by the OFF table above, which
+    -- blanks `battle.player` / `battle.enemy`; and those are the LEFT flanks
+    -- and only the left flanks (src/battle/BattleState.lua:2726). The fifth
+    -- guard is the doubles loop's,
+    --
+    --     onlySide ~= (side == "player" and "enemy" or "player")   (:9729)
+    --
+    -- which nothing was left to carry, so BOTH right-hand Pokemon were baked
+    -- into BOTH textures and the player's right-hand one appeared standing on
+    -- the foe's side of the diorama. That is the report.
+    --
+    -- SINGLES IS UNCHANGED, BRANCH BY BRANCH. The argument reaches exactly
+    -- five tests, and in a single battle the string skips precisely the
+    -- branches OFF had already emptied:
+    --
+    --   side == "enemy"  (OFF: player = false, showPlayerBack = false)
+    --     :9494 :9527  onlySide ~= "player"  -- true before (0), true now
+    --     :9604        onlySide ~= "enemy"   -- was true, but showPlayerBack
+    --                                           was false: not drawn
+    --     :9644        onlySide ~= "enemy"   -- was true, but player was
+    --                                           false: not drawn
+    --   side == "player" (OFF: enemy = false, showEnemyTrainer = false)
+    --     :9494        was true, showEnemyTrainer false: not drawn
+    --     :9527        was true, enemy false: not drawn
+    --     :9604 :9644  onlySide ~= "enemy"   -- true before, true now
+    --
+    --   :9729 is inside `if self:gen3Layout() and self:isDouble()`, which a
+    --   single battle never enters at all.
+    --
+    -- Same draw calls, same order, same arguments, on every layout. OFF stays
+    -- exactly as it is: it is what makes that table above true, and removing
+    -- it would change singles.
+    --
+    -- ------- AND IT GOES IN THE onlySide SLOT, WHICH IS THE FIFTH ONE
+    --
+    -- drawPicsLayer is declared with a COLON --
+    --
+    --     function BattleState:drawPicsLayer(slide, sx, sy, onlySide,
+    --                                        skipMenuClip)
+    --
+    -- so `self` takes the first argument and the real list is SIX long.
+    -- g3-tandem-291 wrote `innerPics(battle, 0, 0, side)`, which put the side
+    -- name in `sy` -- the vertical OFFSET -- and left `onlySide` nil. The layer
+    -- then does `y + sy`, Lua raises "attempt to perform arithmetic on a string
+    -- value", the pcall below re-raises it, and OverworldBattle.textures hands
+    -- back nil for BOTH sides. Every Pokemon in every 3D battle has since drawn
+    -- as the flat pic: riding the projected mark, so its POSITION tracks the
+    -- world, and blitted at the letterbox scale, so its SIZE does not. That is
+    -- the whole of "zooming out does not make them smaller".
+    --
+    -- It also means the clone fix that round shipped has never run: `onlySide`
+    -- was nil throughout, which is the value that let both right-hand battlers
+    -- into both textures in the first place. This is the first build where it
+    -- takes effect.
+    --
+    -- The zero is `sy`, exactly as it was before that round. Nothing else about
+    -- the call changes, and the singles enumeration that round ran still holds
+    -- -- re-run against the TRUE baseline of onlySide = nil rather than the 0 it
+    -- assumed: 32768 single-battle renders, every combination of the fourteen
+    -- fields those five guards read, both sides, OFF applied: 0 differ.
+    innerPics(battle, 0, 0, 0, side)
   end)
 
   texturing = nil
@@ -1363,14 +1970,66 @@ function OverworldBattle.sideTexture(battle, side)
   -- Not the enemy TRAINER pic: that one never goes through frontPlacement at
   -- all, it draws itself straight into its own 7x7 slot, and it is hung from
   -- that slot above.
-  if side == "enemy" and not trainer then
-    local pic = battle.enemy and battle.enemy.sprite
+  --
+  -- ...AND THE OVERRIDE THAT PUTS IT THERE IS NOT ALWAYS REACHED ANY MORE.
+  --
+  -- IN-GAME: a wild TAILLOW jammed into the top-right corner of the frame,
+  -- partly off screen, with the camera untouched. ("the enemy pokemon isnt
+  -- where it should be on the battlefield its too far to the right".)
+  --
+  -- The engine stopped shunting its Gen 3 pics and started PLACING them.
+  -- Gen3Battle.draw says it outright -- "THE PICS ARE PLACED, NOT SHUNTED ...
+  -- the offsets are gone and BattleState asks Gen3Battle.picPlacement instead,
+  -- which measures the platforms out of the cartridge's own battle background"
+  -- -- and BattleState:drawPicsLayer now calls frontPlacement and backPlacement
+  -- ONLY on the classic branch. On a Gen 3 battle this mod's overrides of those
+  -- two, which are the whole mechanism that pinned a pic to TEX_AX / TEX_AY in
+  -- the billboard canvas, never fire at all. The pic lands on the platform --
+  -- Gen3Battle.PLATFORM_FALLBACK.opponent is x = 176 -- and the card goes on
+  -- hanging from column 80. Ninety-six canvas pixels to the right, and about
+  -- twenty-six up from the same mismatch on the vertical. Right and up,
+  -- dominated by the horizontal, which is the frame exactly.
+  --
+  -- (It also, retroactively, is the Zigzagoon: a 64-wide pic at canvas 144..208
+  -- in the 160-wide canvas this mod used before g3-moncard-256 grew it loses
+  -- everything past column 160, which is the "clean vertical cut" that round
+  -- could not account for. Growing the canvas fixed the cut without anybody
+  -- knowing why it was there.)
+  --
+  -- SO THE PLACEMENT IS READ, NOT IMPOSED. `placed[side]` records whether the
+  -- override actually ran (it sets it) and `drawnAt[side]` records where the
+  -- pic was observed to go. When the override ran, nothing changes -- and it
+  -- always runs on Gen 1, Gen 2 and Prism, which is why those layouts cannot
+  -- reach the new branch and are byte-identical by construction. When it did
+  -- NOT run, the engine placed the pic itself, and the card hangs off the
+  -- bottom-centre of where the pic actually went.
+  --
+  -- The foot padding is the same measurement either way and is now taken for
+  -- BOTH sides: `picPlacement` stands a pic on `spot.y` by subtracting its own
+  -- opaque bottom, so `y + (h - pad) * scale` is that same row back again, and
+  -- on the classic path `(96 - h) + (h - pad) = 96 - pad`, which is exactly
+  -- what this line did before.
+  local pad = 0
+  if not trainer then
+    local pic = battle[side] and battle[side].sprite
     -- the RAW sprite rather than the one picImage handed the draw: the paper
     -- fill only ever closes holes the background cannot reach, so it cannot
     -- add ink below the lowest row that already had some, and the two answer
     -- the same baseline
-    local okPad, pad = pcall(BattlePics.footPad, pic)
-    if okPad and type(pad) == "number" and pad > 0 then ay = ay - pad end
+    local okPad, p = pcall(BattlePics.footPad, pic)
+    if okPad and type(p) == "number" and p > 0 then pad = p end
+  end
+  if side == "enemy" and not trainer then
+    if pad > 0 then ay = ay - pad end
+  end
+  if not trainer and placed[side] == nil then
+    local d = drawnAt[side]
+    if d then
+      -- d is { x, y, w * scale, h * scale, scale } -- the rect the pic
+      -- actually occupies in this canvas
+      ax = d[1] + d[3] / 2
+      ay = d[2] + d[4] - pad * (d[5] or 1)
+    end
   end
   -- THE CANVAS'S OWN SIZE TRAVELS WITH THE TEXTURE.
   --
@@ -1744,12 +2403,50 @@ function OverworldBattle.install()
         if mark and slot and mark[1] and mark[2] then
           dx, dy = mark[1] - slot[1], mark[2] - slot[2]
         end
+        -- ...AND THE CLIP THAT PROTECTS THE SLOT DOES NOT FOLLOW IT OUT.
+        --
+        -- The engine draws each side's pic inside its own window: on Emerald
+        -- that is Gen3Battle.draw's inRegion, whose SCISSOR is the foe's slot
+        -- (surface x 112..240) and the player's (x 0..152); on the Game Boy
+        -- layout it is drawPicsLayer's own move-menu row clip. Both are there
+        -- to stop a pic overrunning the furniture AROUND ITS SLOT, and both are
+        -- stated in the slot's coordinates.
+        --
+        -- Move the pic out to the mon's own mark and that clip stops being a
+        -- guard and becomes the bug: the mark is wherever the camera put the
+        -- arena, the foe's cell is usually LEFT of x=112, and the pic is then
+        -- cut to a sliver at the region's edge or clipped away entirely. That
+        -- is why g3-foeslot-271 moved the pic and the foe still came out in the
+        -- wrong place.
+        --
+        -- sideTexture already writes this reasoning down for these same
+        -- scissors -- "there is nothing here for them to protect" -- so the same
+        -- answer: stand them down for this draw, and bound it by the
+        -- BATTLEFIELD instead, which is the layout's own statement of where the
+        -- ground ends (textRect.box is the message strip; everything above it is
+        -- field). The pic may go anywhere on the field and still cannot reach
+        -- the strip.
+        --
+        -- ONLY FOR A PIC THAT HAS ACTUALLY MOVED. dx == dy == 0 is a pic still
+        -- sitting in its slot, and then the slot's own clip is exactly right and
+        -- is left alone -- which is every frame on a layout whose mark and slot
+        -- coincide, and every frame where the shot carries no mark.
         local g = love.graphics
+        local moved = (dx ~= 0 or dy ~= 0) and g.setScissor and g.getScissor
+        local s1, s2, s3, s4
+        if moved then
+          s1, s2, s3, s4 = g.getScissor()
+          local field = geo.textRect and geo.textRect.box and geo.textRect.box[2]
+          g.setScissor(0, 0, geo.width or 160, field or (geo.height or 144))
+        end
         g.push()
         g.translate(dx, dy)
         local okP, errP = pcall(withTint, tint, innerPics, self, slide, sx, sy,
                                 side, skipMenuClip)
         g.pop()
+        if moved then
+          if s1 then g.setScissor(s1, s2, s3, s4) else g.setScissor() end
+        end
         if not okP then error(errP, 0) end
         drew = true
       end
@@ -2091,11 +2788,36 @@ function OverworldBattle.snapHUDs(battle, shot)
     if not opaque then
       for _, rect in pairs(panels) do BattleHud.panel(rect, shot, dark, true) end
     end
-    g.setColor(1, 1, 1, 1)
-    for side, band in pairs(OverworldBattle.bands(geom)) do
-      local quad = g.newQuad(band[1], band[2], band[3], band[4], lw, lh)
-      g.draw(layer, quad, bandX[side] + band[1] * shot.scale,
-             shot.ly + band[2] * shot.scale, 0, shot.scale, shot.scale)
+    -- the panels let the arena through on a layout whose windows are its own
+    -- opaque sprites; see OverworldBattle.PANEL_ALPHA for the measurement
+    g.setColor(1, 1, 1, opaque and OverworldBattle.PANEL_ALPHA or 1)
+    -- the player's band drops to sit just above the message strip; the foe's
+    -- does not move (see OverworldBattle.hudDrop). The band's SOURCE rows are
+    -- untouched -- only where it lands -- so nothing is cut, and the rows the
+    -- drop vacates carry nothing on either layout: the foe's block ends well
+    -- above the cut and the player's begins well below it.
+    local drop = OverworldBattle.hudDrop(battle, geom)
+    -- `battle` as well as `geom`, because a DOUBLE battle's four healthboxes
+    -- are not the pair the layout publishes and the cut has to be derived from
+    -- them instead (see OverworldBattle.bands). Passing nil is exactly today's
+    -- answer, which is what every other caller and every other layout gets.
+    -- a double's four boxes go out per BOX, each to its own side's window edge
+    -- (see OverworldBattle.hudEdgeQuads). nil on every other frame and every
+    -- other layout, which is the branch below, untouched.
+    local edge = OverworldBattle.hudEdgeQuads(battle, geom, shot)
+    if edge then
+      for _, q in ipairs(edge) do
+        local quad = g.newQuad(q[1], q[2], q[3], q[4], lw, lh)
+        g.draw(layer, quad, q.ox + q[1] * shot.scale,
+               shot.ly + q[2] * shot.scale, 0, shot.scale, shot.scale)
+      end
+    else
+      for side, band in pairs(OverworldBattle.bands(geom, battle)) do
+        local dy = (side == "player") and drop or 0
+        local quad = g.newQuad(band[1], band[2], band[3], band[4], lw, lh)
+        g.draw(layer, quad, bandX[side] + band[1] * shot.scale,
+               shot.ly + (band[2] + dy) * shot.scale, 0, shot.scale, shot.scale)
+      end
     end
   end)
   if prevCanvas then g.setCanvas(prevCanvas) else g.setCanvas() end

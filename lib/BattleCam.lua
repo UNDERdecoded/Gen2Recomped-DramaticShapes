@@ -177,7 +177,13 @@ BattleCam.PITCH_MOUSE = 0.0016
 -- together -- so moving the eye alone changes the perspective and not the
 -- framing, which is exactly what the dolly breath above is for.
 BattleCam.ZOOM_MIN = 0.45         -- the pair filling the frame
-BattleCam.ZOOM_MAX = 2.0          -- the fight in its own landscape
+-- How far the zoom reaches OUT on its own, from the solved shot -- one
+-- doubling of the frame. This is the number ZOOM_MAX has always held; it has
+-- only been given a name that says which half of the answer it is, because the
+-- STOP is now this times the swing it has to out-reach. See "HOW FAR OUT THE
+-- ZOOM HAS TO REACH", beside BattleCam.spread, which is the thing it is
+-- derived from.
+BattleCam.ZOOM_REACH = 2.0        -- the fight in its own landscape
 BattleCam.ZOOM_STEP = 1.15
 BattleCam.ZOOM_TIME = 0.18
 
@@ -304,7 +310,7 @@ function BattleCam.stepZoom(notches)
   if not BattleCam.steerable then return false end
   local was = BattleCam.zoomGoal
   BattleCam.zoomGoal = math.max(BattleCam.ZOOM_MIN,
-                        math.min(BattleCam.ZOOM_MAX,
+                        math.min(BattleCam.zoomMax(BattleCam.rigLive),
                                  was * (BattleCam.ZOOM_STEP ^ (notches or 0))))
   return BattleCam.zoomGoal ~= was
 end
@@ -357,6 +363,75 @@ function BattleCam.spread(arena)
                   elev + BattleCam.pitch * BattleCam.PITCH_RANGE) / home
 end
 
+-- ------- HOW FAR OUT THE ZOOM HAS TO REACH
+--
+-- IN-GAME: "when i zoom out they stay pretty much the same size or get
+-- bigger", and then, choosing between the two ways to answer it: pulling back
+-- should win regardless of how the camera is angled.
+--
+-- A Pokemon's apparent size is set by TWO controls, not one:
+--
+--     frameH = base * zoom * spread(arena)
+--
+-- `zoom` is the wheel. `spread` is the ORBIT and the PITCH -- a different
+-- input -- and it is deliberate: it opens the lens as the shot swings toward
+-- side-on so the pair does not fly off the edges. Measured, it moves the frame
+-- by up to 1.94x on the default rig, against a zoom-out range of 2.00x. The
+-- two merely TIED, so steering home while pulling out cancelled the pull and
+-- steering home faster reversed it. That is the report, both halves of it.
+--
+-- So the stop is DEFINED as out-reaching the swing rather than set to a
+-- bigger number: whatever the swing can do on its own, the zoom keeps its own
+-- full reach ON TOP of it. Change spread's range and this follows; the
+-- relationship is the thing being stated, not the number.
+--
+-- swingMax is closed-form rather than searched. At orbit 1 the bearing reaches
+-- pi/2, so axisSpan's first term is cos(elev) and the whole root is
+-- sqrt(cos^2 + sin^2) = 1 WHATEVER the pitch -- the maximum is therefore
+-- 1 / axisSpan(beta, elev), the reciprocal of the solved shot's own span.
+-- Checked against a 41x41 sweep of the entire orbit x pitch square, to four
+-- decimals, on both rigs: tele 1.9389, wide 1.2866.
+--
+-- AND IT CAN NEVER CLAMP ANYTHING TODAY'S PLAYER CAN ALREADY REACH.
+-- axisSpan(b, e) = sqrt(sin(b)^2 cos(e)^2 + sin(e)^2) <= sqrt(cos(e)^2 +
+-- sin(e)^2) = 1 by Pythagoras, for every b and e. So `home` <= 1, swingMax >= 1,
+-- and the stop is >= ZOOM_REACH -- which is the clamp every reachable state was
+-- already inside. The default shot, and every shot anyone has ever framed,
+-- comes out bit-identical on every layout.
+--
+-- PER RIG, because one shared stop is not safe. The indoor rig starts at a
+-- 44-degree lens; giving it the long lens's stop would open it to 132 degrees
+-- at full swing, which is a fisheye in a room. Its own stop takes it to 113,
+-- against the 99 it already reaches today.
+function BattleCam.swingMax(rigId)
+  local R = BattleCam.RIGS[rigId] or BattleCam.RIGS[BattleCam.DEFAULT_RIG]
+  local beta = math.atan2(R.side, R.back)
+  local elev = math.atan2(R.height - R.lookY,
+                          math.sqrt((R.side - R.lookX) ^ 2 + R.back ^ 2))
+  local home = axisSpan(beta, elev)
+  if not (home > 1e-6) then return 1 end
+  -- >= 1 by the Pythagoras argument above; floored anyway so a future rig
+  -- cannot quietly pull the stop in below the reach it is meant to add to
+  return math.max(1, 1 / home)
+end
+
+-- The stop for the rig currently being flown: the zoom's own reach, on top of
+-- whatever the swing can already do.
+function BattleCam.zoomMax(rigId)
+  return BattleCam.ZOOM_REACH * BattleCam.swingMax(rigId)
+end
+
+-- Which rig the shot is on, as `arena.cam` last named it -- nil until the
+-- first rig of a battle is built, and never a reference to the arena itself.
+-- The input side has no arena in hand (CamControl reaches the camera through
+-- an event, not through the scene), so the camera remembers it here the same
+-- way it remembers its own orbit and pitch.
+BattleCam.rigLive = nil
+
+-- Published as a plain number for anything that just wants "the stop", which
+-- on the default rig is what it is. The LIVE stop is zoomMax(rigLive).
+BattleCam.ZOOM_MAX = BattleCam.zoomMax(BattleCam.DEFAULT_RIG)
+
 -- How much world the frame holds right now: the rig's own reach at the
 -- player's zoom and at whatever the orbit has done to the pair's spacing,
 -- or the rig's own alone whenever both are being withheld (VR's fixed
@@ -389,6 +464,18 @@ function BattleCam.update(dt)
                           BattleCam.ORBIT_TIME)
   BattleCam.pitch = chase(BattleCam.pitch, BattleCam.pitchGoal, dt,
                           BattleCam.PITCH_TIME)
+  -- THE STEER IS SESSION STATE AND SURVIVES A BATTLE ENDING (reset() only
+  -- zeroes the drift's phase; recentre() is the one that puts the shot back and
+  -- nothing calls it). So a zoom pulled out to the long lens's stop OUTDOORS
+  -- arrives inside an indoor fight, whose own stop is tighter -- and it has to
+  -- come back into range or the fisheye this stop exists to avoid is reachable
+  -- by walking rather than by scrolling. Eased, not snapped, by leaving the
+  -- chase to do it: the goal moves and the value follows it like any other.
+  --
+  -- Cannot fire on anything reachable before this change: every rig's stop is
+  -- >= ZOOM_REACH, which is the clamp that produced every existing zoom.
+  local stop = BattleCam.zoomMax(BattleCam.rigLive)
+  if BattleCam.zoomGoal > stop then BattleCam.zoomGoal = stop end
   BattleCam.zoom = chase(BattleCam.zoom, BattleCam.zoomGoal, dt,
                          BattleCam.ZOOM_TIME)
 end
@@ -418,6 +505,9 @@ end
 function BattleCam.rig(arena, groundY, canonical)
   groundY = groundY or 0
   local R = BattleCam.rigFor(arena)
+  -- ...and which rig that was, for the input side, which cannot see the arena
+  -- (see BattleCam.zoomMax). The name only; nothing holds the arena table.
+  BattleCam.rigLive = arena and arena.cam or nil
   local mx, mz = arena.mid[1], arena.mid[2]
   -- VR asks for the same stillness for its own reason (see BattleCam.still)
   local fixed = BattleCam.still or canonical

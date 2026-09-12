@@ -66,8 +66,24 @@ AntiAlias.setting = ModSetting.new(AntiAlias.KEY, AntiAlias.LABEL,
 -- reader gets on a frame that never opened a pass at all.
 local live = 1
 
+-- The PERFORMANCE tier's ceilings (see lib/Tier.lua).
+local Tier_
+local function caps()
+  if not Tier_ then Tier_ = V.require("Tier") end
+  return Tier_.caps()
+end
+
 function AntiAlias.samples()
-  return tonumber(AntiAlias.setting:get()) or 0
+  local n = tonumber(AntiAlias.setting:get()) or 0
+  -- The row's own help already calls this "the most expensive row in the
+  -- mod", and it is the only row here that multiplies EVERY pass in the
+  -- frame -- the sun's included, since the scene canvas it is fitted to
+  -- grew with it.  A ceiling rather than a setting, like the others: the
+  -- stored rung is never rewritten, so a tier raised again restores the
+  -- player's exact choice.  nil at HIGH.
+  local cap = caps().aa
+  if cap and n > cap then n = cap end
+  return n
 end
 
 -- What the row ASKS for. The scale in force is `factor()`, which is this

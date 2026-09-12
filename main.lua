@@ -183,6 +183,11 @@ end
 
 -- ------- pipelines
 
+local Perf = V.require("Perf")
+-- The PERFORMANCE tier's ceilings. Required here as well as where it is
+-- clamped so that a tree with a broken Tier.lua fails at LOAD, loudly, and
+-- not on the first frame the player lowers the row.
+local Tier = V.require("Tier")
 local Voxel = V.require("VoxelState")
 local Voxel3D = V.require("Voxel3D")
 local VoxelScene = V.require("VoxelScene")
@@ -346,12 +351,24 @@ mod.content.render_pipelines:register("voxel", {
     if ow and ow.map and ow.camera then
       pcall(VoxelScene.prefetch, ow)
     end
+    -- THE BUILD SLICE, MEASURED SEPARATELY FROM THE FRAME.
+    --
+    -- This is the whole of the mod's build cost as the player experiences
+    -- it: a map's shape analysis plus its geometry, drained a slice at a
+    -- time. It is worth its own span because it is felt as a HITCH and not
+    -- as fps -- `max` on this label is the number that matters, and it is
+    -- large: Structures.forMap is not interruptible (the budget can only
+    -- suspend the geometry coroutine), so the first pump on arriving at a
+    -- map carries the whole analysis in one frame.
+    local tPump = Perf.now()
     ChunkMesher.pump(Game and Game.stack
                      and Game.stack:top() ~= ow)
+    Perf.add("ChunkMesher.pump", tPump)
     pumpPrebake()
   end,
 
   drawWorld = function(ctx)
+    local tFrame = Perf.now()
     -- the palette closure, stashed for the VR frame: it renders from the
     -- update hook, where no ctx exists to carry one
     VR.paletteFor = ctx.paletteFor
@@ -407,8 +424,23 @@ mod.content.render_pipelines:register("voxel", {
     end
     -- and back to the window's own size, which is what the engine composites
     -- one canvas pixel to one display pixel.  A pass-through when AA is off.
+<<<<<<< Updated upstream
     canvas = AntiAlias.resolve(canvas, sw, sh, "world")
     return WorldCanvasOrientation.present(canvas, "overworld")
+=======
+    local out = AntiAlias.resolve(canvas, sw, sh, "world")
+    -- THE FRAME SEAM.  Perf.frame stamps one whole-frame time per RENDERED
+    -- frame and this is the only place in the mod that is reached exactly
+    -- once per rendered world frame -- Pipelines calls drawWorld from
+    -- love.draw, and a scripted run that steps the game ten times per
+    -- render still passes here once. Every one of these three calls is a
+    -- boolean test away from doing nothing while DS_PERF is unset, which
+    -- is every player's session.
+    Perf.add("voxel.drawWorld", tFrame)
+    Perf.frame()
+    Perf.drawStats()
+    return out
+>>>>>>> Stashed changes
   end,
 
   invalidate = function()
@@ -487,6 +519,14 @@ applyFull = function(level)
   -- most photographed, and a lake with the sky and the shoreline in it is
   -- most of what makes the model read as being outdoors
   Water.setting:setIndex(1, Game)
+  -- and the cast standing in it, for the reason the line above is here at
+  -- all. FULL takes both rows OFF the OPTIONS menu (they parameterise the
+  -- look, which is what the preset owns), and a row that is off the menu and
+  -- NOT set by the preset that removed it is a value the player can no
+  -- longer reach -- which is the trap TILT and GBC FX are pinned to avoid.
+  -- Index 1 is ON, which is what this mode has drawn since the reflection
+  -- pass existed.
+  Water.castSetting:setIndex(1, Game)
   -- and the view fitted to the window
   opts.zoom = 0
   Zoom.applyOptions(opts)
@@ -542,6 +582,33 @@ local SETTINGS = {
     .. "shoreline, the trees and the buildings behind it; SKY is the sky, "
     .. "the sun and the moon alone, which is most of the look for a "
     .. "fraction of the cost." },
+  -- Directly under WATER, because it is the second half of the same
+  -- question and the grouped block keeps them together on the menu.
+  --
+  -- `when` gates it on there being a MIRROR for the cast to be in at all.
+  -- Below FULL the water shader's `rays` is 0 and it never samples the
+  -- reflection copy, so an ON here would decide precisely nothing -- and a
+  -- row that no longer decides anything is worse than no row, which is the
+  -- same call BACK SPRITES makes against a staged fight two entries down.
+  -- It is Water.level() rather than the stored value on purpose: the
+  -- PERFORMANCE tier's ceiling is what actually decides whether the march
+  -- runs, so a player on BALANCED -- where the ceiling holds WATER at SKY
+  -- whatever the row says -- correctly does not see this row either.
+  --
+  -- NOT marked `full`: this parameterises the LOOK of the diorama, exactly
+  -- like WATER, V-GRID and V-CURVE, so the FULL preset owns it and takes it
+  -- off the OPTIONS menu on the same reasoning it takes those three. The
+  -- mod manager's own page carries it either way.
+  { Water.castSetting,
+    "Show people in the water: NPCs, Pokemon and your own character "
+    .. "reflected in the surface they are standing beside, along with the "
+    .. "shoreline behind them. This is the only part of the reflection "
+    .. "that costs DRAW CALLS rather than fill rate -- every character on "
+    .. "screen is drawn a second time, into the picture the water reflects "
+    .. "-- so it is the one to turn off on a busy map if the water is "
+    .. "costing you frames and you want to keep the shoreline. Needs WATER "
+    .. "on FULL; there is no reflection to be in below that.",
+    when = function() return Water.level() >= 2 end },
   -- `full` marks a row FULL does not take away. FULL owns the diorama's own
   -- knobs; what a battle is drawn over, and how it is framed, are not that.
   -- Off the OPTIONS menu while VR is on: the headset REQUIRES staged

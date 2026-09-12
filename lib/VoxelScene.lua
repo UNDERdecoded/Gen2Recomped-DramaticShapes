@@ -13,6 +13,12 @@
 local V = ...
 
 local Mat4 = V.require("Mat4")
+local Perf = V.require("Perf")
+-- The PERFORMANCE tier's ceilings (lib/Tier.lua). Top-level here rather
+-- than lazily as in ShadowMap/Water/AntiAlias: Tier requires nothing from
+-- this mod, so there is no load order to protect, and the sun's rate
+-- limiter reads it once per stale frame.
+local Tier = V.require("Tier")
 local Voxel3D = V.require("Voxel3D")
 local ShadowMap = V.require("ShadowMap")
 local ChunkMesher = V.require("ChunkMesher")
@@ -514,9 +520,18 @@ end
 -- The sheet frame and mirror flag the 2D path would draw for this pose
 -- (same tables as SpriteRenderer). Shared by the billboard pass and the
 -- shadow pass so a walking character's shadow swings its legs too.
-local function frameFor(def, facing, phase, flip)
+local function frameFor(def, facing, phase, flip, stated)
   local SR = require("src.render.SpriteRenderer")
   local frame, mirror = 0, false
+  -- A SHEET ROW THE OBJECT NAMES ITSELF OUTRANKS THE FACING TABLE.
+  --
+  -- `stated` is the pose's own `frame` (see statedFrame): a fixed-frame
+  -- object's row, or the row a berry tree's GROWTH STAGE names.  No mirror --
+  -- the mirror is the facing math's, and an object that has no facing has no
+  -- left and right to swap.  nil for everybody else, so the four lines below
+  -- are what every other card in the game still gets.
+  local said = tonumber(stated)
+  if said then return said, false end
   -- SPRITE_POKEMON objects carry a 2-frame party icon with no facing at all,
   -- so the pose tables (which index up to 5) do not apply to them
   if def.monIcon then
@@ -560,9 +575,10 @@ end
 -- ground along the sun line (Voxel3D.shadowMatrix). Runs inside
 -- beginShadows, which supplies the translucent black; the texture is only
 -- consulted for its alpha, so no palette work is needed.
-local function drawShadow(sprite, px, py, facing, phase, flip, gh, lift)
+local function drawShadow(sprite, px, py, facing, phase, flip, gh, lift,
+                          stated)
   local def = sprite.def
-  local frame, mirror = frameFor(def, facing, phase, flip)
+  local frame, mirror = frameFor(def, facing, phase, flip, stated)
   local mesh = SpriteBillboards.shadowQuad(def, frame)
   if not mesh then return end
   -- the decal is the card squashed onto the ground, so it is anchored like
@@ -677,7 +693,7 @@ end
 -- `lift` raises the figure off the ground plane (ledge hops arc UP in 3D,
 -- where the 2D path could only slide the sprite north).
 local function drawEntity(sprite, px, py, facing, phase, flip, gh, colors,
-                          lift)
+                          lift, stated)
   local def = sprite.def
   local tex = sprite:resolveImage()
   if colors and not def.trueColor then
@@ -690,7 +706,7 @@ local function drawEntity(sprite, px, py, facing, phase, flip, gh, colors,
   -- LEANS BACK, pivoting at its feet, by exactly the camera's pitch, so
   -- at every tilt level the sprite reads face-on like the flat game.
   -- No camera-tracking yaw: every sprite leans in parallel.
-  local frame, mirror = frameFor(def, facing, phase, flip)
+  local frame, mirror = frameFor(def, facing, phase, flip, stated)
   local mesh = SpriteBillboards.mesh(def, frame)
   if not mesh then return false end
   -- Camera-ward pull (applied per vertex in the shader, along each
@@ -740,7 +756,7 @@ VoxelScene.drawEntity = drawEntity
 -- mesh for it.
 local function drawGhost(p)
   local def = p.sprite.def
-  local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip)
+  local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip, p.frame)
   local mesh = SpriteBillboards.shadowQuad(def, frame)
   if not mesh then return end
   local tex = p.sprite:resolveImage()
@@ -1089,10 +1105,274 @@ end
 -- answer falls back to exactly the `e.hidden` the flat path already gave.
 local GEN3_MOVEMENT_HIDDEN = 0x4C
 
+-- ------- THE BERRY PLOTS
+--
+-- IN-GAME LOCATION: ROUTE 104's berry patch, cells (34,6), (35,6) and (36,6)
+-- -- the three plots on the soil strip beside the PRETTY PETAL FLOWER SHOP,
+-- which is the frame the report arrived with.  The same three functions cover
+-- all 88 of Hoenn's plots.
+--
+-- Reported from play: "ensure berry trees and sprouts appear as sprites do
+-- currently theyre not appearing with voxels on and i just see mounds of
+-- dirt".
+--
+-- THE MOUND IS THE PLOT, NOT THE PLANT.  Emerald marks a berry plot's own
+-- cell impassable -- you cannot walk into the tree -- and it is otherwise an
+-- ordinary MB_NORMAL cell, so the cell rules read it as a solid mass and
+-- stand its drawing up.  Measured over all 518 maps: of the object events
+-- that carry the berry tree's graphics row, 87 stand on a cell the shape pass
+-- made non-flat -- 48 `cylinder`, 39 `cliff` -- and `buildCylinders` lathes
+-- the plot's own dark soil art into a 16px round hull.  That hull, wearing
+-- the soil metatile's own two tones at the terrain lighting's two levels, is
+-- what the report calls a mound of dirt.
+--
+-- THE PLANT IS AN OBJECT EVENT STANDING ON THAT SAME CELL.  The mod's own
+-- data file has said so from the start -- data/gen3_shapes.lua, at
+-- MB_BERRY_TREE_SOIL: "Berry soil is here too: the plant growing in it is an
+-- object sprite, not part of the metatile."  And it is not dropped anywhere:
+-- measured, every berry tree template in Hoenn carries movement type 12
+-- (FACE_DOWN), not 0x4C, so `castHides` answers false for all of them; they
+-- are in `state.entities` like every other live NPC; and their card builds.
+--
+-- What is wrong is WHERE THEIR FEET GO.  `groundAt` answers the floor the
+-- hull STANDS ON (the terrace, or the stamp `buildCylinders` recorded under
+-- it), not the hull's top, so the card is planted at the BOTTOM of a solid
+-- 16px hull that fills its own cell.  A billboard leans back by exactly the
+-- camera's pitch (see billboardMatrix), so a 32px card rises only
+-- 32*cos(90 - pitch) above its feet: 8px at the 15-degree rung, 18px at 35,
+-- 25px at 50.  At every diorama rung below the first-person one the whole
+-- card -- minus the sheet's empty top margin, which is the only part that
+-- clears -- is inside the mound, and the depth test eats it.  Nothing is
+-- hidden, nothing is mis-framed, nothing is at zero scale: it is buried.
+--
+-- WHY THE MOUND IS LEFT EXACTLY AS IT IS.  It is the SECOND defect here and
+-- it is a GEOMETRY defect: a berry plot is flat tilled soil in the cartridge,
+-- this mod's own behaviour table already says `[0xA0] = "ground"`, and the
+-- cell only reads as a mass because its collision bit is set for the object
+-- standing on it.  Correcting that moves shape state on 87 cells, and this
+-- round is under a geometry freeze, so it is measured, recorded and refused
+-- here rather than smuggled in beside a presentational fix.
+
+-- THE TOP OF THE HULL STANDING ON A CELL, asked of the only thing that
+-- knows: the ROUND STAMP the mesher expands there.
+--
+-- The shape record cannot answer this and it was tried first.  Route 104
+-- (3,22) and (22,41) carry byte-identical shapes -- class=cylinder, h=16,
+-- base=16, stamp=16, skip=true -- and the mesher draws a hull on one and
+-- flat ground on the other, because `buildCylinders` decides which cells get
+-- a STAMP and only a stamped cell grows a hull.  Any rule read off `shape.h`
+-- plus a class height therefore floats a plant wherever it guesses wrong,
+-- and a floating plant is a worse frame than a buried one.
+--
+-- So this reproduces ChunkMesher's own placement, line for line: the stamp
+-- centred on THIS cell, lifted to `my` (the stamp's own base, overridden on
+-- a Gen 3 skip cell by the floor painted under it -- the branch whose
+-- comment is "a stamp can stand above the floor" and its Mossdeep sequel),
+-- plus the tallest y in the stamp's quads.  Verified against the geometry
+-- the mesher actually emits, cell by cell, over all 88 berry trees in Hoenn:
+-- 48 cells carry a stamp and the prediction equals the measured top on every
+-- one of them, exactly; 22 carry none and their measured top already equals
+-- what groundAt answers; and 18 stand on a COLUMN rather than a stamp (a
+-- cliff face, or a hull anchored on a neighbour) where this answers nil and
+-- nothing moves -- named in NOTES as the half this round does not reach.
+--
+-- CENTRED ON THE CELL, not merely covering it.  A stamp's radius is 16, so
+-- its footprint spills into the neighbours: at Route 104 (22,41) the covering
+-- set includes the 32px TREE hulls of the row above, and taking their top
+-- would stand the plant on a tree.  The centre test is what makes the answer
+-- this cell's own drawing.
+--
+-- Memoised per cell against the Structures analysis (weak-keyed, so a map
+-- the cache evicts takes its index with it): the scan is 782 comparisons and
+-- one stamp's quads, once per plot, and there are at most a handful of plots
+-- in view.
+local hullTops = setmetatable({}, { __mode = "k" })
+
+local function drawnTop(map, cellX, cellY)
+  local okS, S = pcall(Structures.forMap, map)
+  if not (okS and type(S) == "table" and S.roundStamps) then return nil end
+  local memo = hullTops[S]
+  if memo == nil then memo = {}; hullTops[S] = memo end
+  local k = cellY * 8192 + cellX
+  local hit = memo[k]
+  if hit ~= nil then return hit or nil end
+  local mx, mz = cellX * 16 + 8, cellY * 16 + 8
+  local best = nil
+  for _, st in ipairs(S.roundStamps) do
+    if st.mx == mx and st.mz == mz then
+      local sr = st.r or 8
+      local my = tonumber(st.my) or 0
+      if S.isGen3 and S.skip then
+        local acx = math.floor((mx - sr) / 16) * 2
+        local acz = math.floor((mz - sr) / 16) * 2
+        if S.skip[(acz + 64) * 4096 + (acx + 64)] then
+          local okF, fy = pcall(Structures.stampGround, map, acx, acz)
+          if okF and type(fy) == "number" then my = fy end
+        end
+      end
+      local hi = nil
+      for _, q in ipairs(st.quads or {}) do
+        for j = 1, 4 do
+          local y = q[j] and q[j][2]
+          if y and (hi == nil or y > hi) then hi = y end
+        end
+      end
+      if hi then
+        local top = my + hi
+        if best == nil or top > best then best = top end
+      end
+    end
+  end
+  memo[k] = best or false
+  return best
+end
+
+-- A PLANTED OBJECT STANDS ON THE DRAWING, NOT INSIDE IT.
+--
+-- Asked of the BERRY TREE ALONE, and by IDENTITY rather than by class.  The
+-- engine hangs `berryTreeId` on exactly these objects and on nothing else
+-- (OverworldState.pooledNPC, through Gen3Commands.isBerryTree, which matches
+-- the graphics ids the import found by the frame table's own shape); the flat
+-- path reads the very same field to decide whether a plot is empty.  Identity
+-- is the only reliable test here -- it is the conclusion the player's own
+-- invisibility forced on castHides, for the same reason -- because a CLASS
+-- test would also lift the three other objects in Hoenn that stand on a
+-- `cylinder` cell: Southern Island's Latios, Birth Island's Deoxys triangle
+-- and one of Devon Corp 3F's hidden helpers.  Nobody reported those, nobody
+-- measured them, and one of them is never drawn at all.
+--
+-- A LIFT ONLY, NEVER A LOWERING.  Measured against the mesher's own emitted
+-- geometry over all 88 of Hoenn's berry trees: 48 stand on a lathed hull and
+-- every one of them rises by 14px (40 of them) or 15px (8) -- the hull's own
+-- measured height, not a tuned constant, and the whole distribution is those
+-- two adjacent values with nothing else in it.  The other 40 do not move:
+-- 22 already stand on the top of what is drawn at their cell, and 18 stand on
+-- a COLUMN whose top `drawnTop` declines to guess at.  Nothing anywhere is
+-- lowered, so no plant can be sunk into a bank by this.
+--
+-- nil for every Gen 1, Gen 2 and Prism object, which carry no `berryTreeId`
+-- at all, and for a Gen 3 object standing on ordinary flat soil (`drawnTop`
+-- answers nil for a flat cell), so both are left at exactly the height they
+-- were drawn at before.
+local function plantedOn(map, e, gh)
+  if e == nil or e.berryTreeId == nil then return gh end
+  if not Gen3.mapIsGen3(map) then return gh end
+  local top = drawnTop(map, e.cellX, e.cellY)
+  if type(top) == "number" and type(gh) == "number" and top > gh then
+    return top
+  end
+  return gh
+end
+
+-- The growth stage this plot is at, or nil when the question does not apply.
+--
+-- Asked EVERY FRAME, never remembered: "a plot's answer changes while you are
+-- standing there.  A tree is planted, grows and is picked without the map
+-- reloading" -- which is the flat path's own comment over `plotEmpty`, and
+-- this is the same read through the same function.  0 is an empty plot.
+--
+-- pcall'd exactly as the flat path pcalls it: on an engine whose
+-- Gen3Commands has no berry reader the call fails, this answers nil, and
+-- every branch below behaves as it did before the patch.
+local function berryStage(e)
+  local id = e and e.berryTreeId
+  if id == nil then return nil end
+  local ok, stage = pcall(function()
+    local G = require("src.core.Game")
+    return require("src.script.Gen3Commands").berryTreeStage(G and G.save, id)
+  end)
+  if not ok then return nil end
+  return tonumber(stage) or 0
+end
+
+-- The frame this entity's own drawing STATES, as against the one its facing
+-- implies.  nil for everybody else, in every generation.
+--
+-- TWO SOURCES, in the engine's own order of authority:
+--
+--   1. `e.fixedFrame` -- the engine's published channel for an object that
+--      draws ONE sheet row and has no facing at all.  `NPC:draw` branches on
+--      it into `SpriteRenderer:drawFixedFrame`, whose own comment says "no
+--      facing, no walk cycle... the object's movement data (not its facing)
+--      says which one it is, so the ordinary facing math must never touch
+--      it".  `NPC:pose` does not return it, so `posesOf` never saw it and
+--      `frameFor` -- whose comment promises "the very frame the 2D path would
+--      draw (same tables)" -- could only ever answer the facing table.  That
+--      is a real divergence for every fixed-frame object, berries aside.
+--
+--   2. A BERRY TREE'S GROWTH STAGE.  Emerald draws a berry tree from two
+--      things, and neither is its facing: a sheet chosen by the BERRY and a
+--      frame chosen by the STAGE.  The import records the second of those
+--      verbatim -- `constants.gen3Berries.trees.stages[stage]` is the list of
+--      frames that stage cycles, read off the tree's own animation table --
+--      precisely "so that the step that draws it is mechanical".  This is
+--      that step, for this pass.
+--
+--      Guarded on the sheet actually having frames to choose between: if the
+--      engine hands a berry tree a ONE-frame sheet (a per-stage sprite chosen
+--      upstream, which `pose()` would already be carrying for both paths),
+--      `frames <= 1`, this declines, and `frameFor` answers 0 exactly as it
+--      does today.  The two readings can never fight.
+--
+--      The first frame of the stage, not the second: stages 2..5 sway between
+--      two frames on the cartridge's own animation clock, and this pass has
+--      no clock for that object.  A still plant, at the right stage.
+--      GEN 3 ONLY, and deliberately.  `fixedFrame` is not a Gen 3 field --
+--      it is the extractor's row pin for POLISHED's ball/cut/fruit sheet,
+--      where a cut tree is frame 1 and a fruit tree frame 2 -- and those
+--      objects have the very same divergence in this pass: the flat path
+--      blits their stated row and the diorama draws frame 0, the ball.  That
+--      is a real defect and it is NOT fixed here, because it is a Gen 2 /
+--      Prism behaviour change this round has no way to measure, and the
+--      standing rule is that anything outside a Gen 3 arm must be PROVEN
+--      neutral for all three.  Recorded in NOTES (g3-orchard-289) so the next
+--      reader does not mistake it for a symptom of this one.
+local function statedFrame(map, e)
+  if e == nil then return nil end
+  if not Gen3.mapIsGen3(map) then return nil end
+  local fixed = tonumber(e.fixedFrame)
+  if fixed then return fixed end
+  if e.berryTreeId == nil then return nil end
+  local sp = e.sprite
+  local def = sp and sp.def
+  if not (def and (tonumber(def.frames) or 1) > 1) then return nil end
+  local stage = berryStage(e)
+  if not stage or stage <= 0 then return nil end
+  local ok, frame = pcall(function()
+    local G = require("src.core.Game")
+    local c = G and G.data and G.data.constants
+    local trees = c and c.gen3Berries and c.gen3Berries.trees
+    local row = trees and trees.stages and trees.stages[stage]
+    return row and tonumber(row[1]) or nil
+  end)
+  return (ok and frame) or nil
+end
+
 local function castHides(e, isPlayer)
   if e == nil then return false end
   local told = e.hidden
   if told ~= nil then return told and true or false end
+  -- A BERRY PLOT WITH NOTHING IN IT IS SOIL, NOT A TREE.
+  --
+  -- The flat path has always honoured this and this pass never did, which is
+  -- the same divergence `e.hidden` was -- a third time.  OverworldState's
+  -- draw loop calls it `plotEmpty`: "all 88 of Hoenn's plots drew the same
+  -- tree sprite whatever was -- or was not -- growing in them, and on a fresh
+  -- save that is nothing at all, because the cartridge blanks every one of
+  -- its 128 tree slots at new game."  HIDDEN RATHER THAN ABSENT, for the same
+  -- reason it is there: the object still blocks its cell and pressing A on it
+  -- still runs the script that plants a berry, and none of that is this
+  -- pass's business.  Only the card is dropped.
+  --
+  -- It is asked HERE and not at spawn because the answer changes while you
+  -- are standing there -- plant, water, pick -- and castHides runs once per
+  -- entity per frame, which is exactly the flat path's cadence.
+  --
+  -- Ordered after `e.hidden` and before the movement type, because a script
+  -- that has taken a specific object off screen outranks the plot's own
+  -- state, and because an empty plot is never the player.
+  local stage = berryStage(e)
+  if stage ~= nil and stage <= 0 then return true end
   -- ...AND THE MOVEMENT TYPE IS ASKED ONLY OF AN OBJECT EVENT.
   --
   -- MOTIVATED BY THE PLAYER GOING INVISIBLE IN LITTLEROOT TOWN.
@@ -1143,12 +1423,20 @@ local function posesOf(state, spriteColors)
     -- conditionally would leave it a frame behind every time it reappeared.
     local sprite, vx, vy, facing, phase, flip = g.npc:pose()
     if not castHides(g.npc) then
+      local gmap = g.map or state.map
       posed[#posed + 1] = {
         sprite = sprite, px = vx + g.ox, py = g.npc.py + g.oy,
         facing = facing, phase = phase, flip = flip,
-        gh = groundAt(g.map or state.map, g.npc.cellX, g.npc.cellY,
-                      g.npc.elevation, vx + g.ox, g.npc.py + g.oy),
-        lift = g.npc.py - vy, colors = spriteColors(g.map or state.map),
+        -- ...on the drawing its cell became, where that is a berry plot (see
+        -- plantedOn).  A ghost stands on ITS OWN map, so the question goes to
+        -- that map exactly as the ground lookup beside it does.
+        gh = plantedOn(gmap, g.npc,
+                       groundAt(gmap, g.npc.cellX, g.npc.cellY,
+                                g.npc.elevation, vx + g.ox, g.npc.py + g.oy)),
+        -- the frame this entity's drawing states, when it states one; nil
+        -- leaves frameFor answering exactly the facing table it always did
+        frame = statedFrame(gmap, g.npc),
+        lift = g.npc.py - vy, colors = spriteColors(gmap),
       }
     end
   end
@@ -1159,7 +1447,10 @@ local function posesOf(state, spriteColors)
         posed[#posed + 1] = {
           sprite = sprite, px = vx, py = e.py,
           facing = facing, phase = phase, flip = flip,
-          gh = groundAt(state.map, e.cellX, e.cellY, e.elevation, vx, e.py),
+          gh = plantedOn(state.map, e,
+                         groundAt(state.map, e.cellX, e.cellY, e.elevation,
+                                  vx, e.py)),
+          frame = statedFrame(state.map, e),
           lift = e.py - vy, colors = colors,
         }
         if e == state.player then
@@ -1250,7 +1541,7 @@ local function drawCast(state, posed, atlasFor)
   for _, p in ipairs(posed) do
     if not (p.isPlayer and hideMe) then
       drawEntity(p.sprite, p.px, p.py, viewFacing(p), p.phase, p.flip, p.gh,
-                 p.colors, p.lift)
+                 p.colors, p.lift, p.frame)
     end
   end
   -- back on for everything textured from the atlas again -- figures, grass
@@ -1337,6 +1628,7 @@ end
 -- flat water). Confined to the curve there is no regression to reach: the
 -- flat world never had the far-shore bug in the first place.
 function VoxelScene.drawWater(draws, cast)
+  local tW = Perf.now()
   -- prepass only under the bend; see the header
   local curved = (Voxel3D.curveK or 0) > 0
   if curved then
@@ -1346,7 +1638,16 @@ function VoxelScene.drawWater(draws, cast)
   end
   local plain = not curved
   if Water.enabled() and Voxel3D.depthReadable() then
-    local mirror, depth = Voxel3D.beginWater(cast)
+    -- `cast` only where something will actually LOOK at the mirror. Below
+    -- FULL the shader's `rays` is 0 and it never samples reflectTex at all,
+    -- so the cards would be drawn a second time into a texture no pass
+    -- reads -- which at the BALANCED tier, where the ceiling holds WATER at
+    -- SKY, was every frame in Lilycove paying for a hundred and thirty-odd
+    -- draws nobody looked at (see Water.castLevel). With the WATER SPRITES
+    -- row ON at FULL this is exactly the `cast` it always was, and the
+    -- frame is the frame it always drew.
+    local mirror, depth = Voxel3D.beginWater(Water.reflectCast() and cast
+                                             or nil)
     local w, h = Voxel3D.size()
     local ok = mirror and depth and Water.begin({
       reflect = mirror, depth = depth,
@@ -1378,19 +1679,42 @@ function VoxelScene.drawWater(draws, cast)
       Voxel3D.draw(d[1], d[2], d[3])
     end
   end
+  Perf.add("VoxelScene.drawWater", tW)
 end
+
+-- How many STALE frames the sun has seen, and which of them it last drew
+-- on: the rate limiter's whole state (see castShadows). Counted in stale
+-- frames rather than in rendered ones on purpose -- a scene where nothing
+-- moves at all does not want a redraw every third frame, it wants none.
+local shadowStale, shadowLastCast = 0, -1000
+local shadowLastStatic = nil
 
 -- A stamp of everything the sun pass depends on. Nothing in it moving
 -- means the shadow map it produced last frame is still exactly right, and
 -- redrawing the whole world from the sun would buy nothing -- which is
 -- most of a dialog, a menu, or any moment standing still.
 local sigBuf = {}
-local function shadowSignature(terrain, nbMesh, posed, cx, cy, vw, vh)
-  local n = 0
-  local function put(v)
-    n = n + 1
-    sigBuf[n] = v
-  end
+local sigN = 0
+local function sigPut(v)
+  sigN = sigN + 1
+  sigBuf[sigN] = v
+end
+
+-- THE HALF OF THE STAMP THAT IS NOT THE MOVING CAST.
+--
+-- Split out of shadowSignature below (which still appends the cast to it,
+-- so the full stamp is exactly the terms it always carried) because the two
+-- halves fail in completely different ways when they go stale. If the
+-- CAMERA has moved, or the view size has, or the sun has swung, or a
+-- neighbour's mesh has arrived, then the map that exists was fitted to a
+-- different frustum and reusing it does not make a shadow late -- it makes
+-- it WRONG, in the wrong place, on the wrong geometry. If only the cast has
+-- moved, the map is still fitted correctly and every static shadow in it is
+-- still exactly right; the only thing out of date is where a walking person
+-- put their own shadow, and that is an error of a pixel or two that a tier
+-- is allowed to trade for half the frame (see castShadows).
+local function shadowStaticTerms(terrain, nbMesh, cx, cy, vw, vh)
+  local put = sigPut
   -- quarter-pixel camera granularity: the light frustum is snapped to
   -- whole texels anyway, each a third of a world pixel
   put(math.floor(cx * 4))
@@ -1413,12 +1737,28 @@ local function shadowSignature(terrain, nbMesh, posed, cx, cy, vw, vh)
   put(FirstPerson.signature())
   put(tostring(terrain))
   for i = 1, #nbMesh do put(tostring(nbMesh[i])) end
+end
+
+-- The static half alone, for the rate limiter in castShadows. Shares the
+-- one buffer with the full stamp and is only ever called after it, so the
+-- string the full stamp already produced has been copied out by concat.
+local function shadowStaticSignature(terrain, nbMesh, cx, cy, vw, vh)
+  sigN = 0
+  shadowStaticTerms(terrain, nbMesh, cx, cy, vw, vh)
+  for i = sigN + 1, #sigBuf do sigBuf[i] = nil end
+  return table.concat(sigBuf, ",")
+end
+
+local function shadowSignature(terrain, nbMesh, posed, cx, cy, vw, vh)
+  sigN = 0
+  shadowStaticTerms(terrain, nbMesh, cx, cy, vw, vh)
+  local put = sigPut
   for _, p in ipairs(posed) do
     put(p.sprite.def.image)
     put(p.px); put(p.py); put(p.gh); put(p.lift or 0)
     put(p.facing); put(p.phase); put(p.flip and 1 or 0)
   end
-  for i = n + 1, #sigBuf do sigBuf[i] = nil end
+  for i = sigN + 1, #sigBuf do sigBuf[i] = nil end
   return table.concat(sigBuf, ",")
 end
 
@@ -1441,6 +1781,40 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
   -- has to follow them (VR frames only; see render)
   if battleToken then sig = sig .. "|btl" .. tostring(battleToken) end
   if not ShadowMap.stale(sig) then return end
+
+  -- THE SUN DOES NOT HAVE TO FOLLOW EVERY FOOTSTEP.
+  --
+  -- The stamp above is honest and it is also why this pass runs on every
+  -- single frame: it stales on any caster moving, and in a town or a wood
+  -- somebody is always mid-step. Measured standing still in Petalburg
+  -- Woods with nothing left to build: 202 sun passes in 202 rendered
+  -- frames, 53% of VoxelScene.render, to re-record a terrain mesh that had
+  -- not changed by one vertex.
+  --
+  -- So BALANCED rate-limits the CAST half and only the cast half. The
+  -- static half (camera, view, sun angle, first-person head, the meshes
+  -- themselves) still forces a redraw on the frame it changes, because a
+  -- map fitted to last frame's frustum is a wrong shadow rather than a late
+  -- one -- see shadowStaticTerms. What is delayed is strictly "somebody
+  -- took a step", and at the shipped rate of 3 the worst case is a walker's
+  -- own shadow two frames behind their feet, which at walking pace is under
+  -- two world pixels.
+  --
+  -- nil at HIGH -- the branch is skipped entirely and this function behaves
+  -- exactly as it did, redraw for redraw.
+  local hz = Tier.caps().shadowHz
+  if hz and hz > 1 then
+    local st = shadowStaticSignature(terrain, nbMesh, cx, cy, vw, vh)
+    shadowStale = shadowStale + 1
+    if st == shadowLastStatic and (shadowStale - shadowLastCast) < hz then
+      Perf.count("shadow.throttled")
+      return
+    end
+    shadowLastStatic, shadowLastCast = st, shadowStale
+  end
+
+  Perf.count("shadow.cast")
+  local tSun = Perf.now()
   if not ShadowMap.begin(cx, cy, vw, vh) then return end
 
   ShadowMap.draw(terrain, atlasFor(state.map), nil)
@@ -1491,7 +1865,7 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
     -- swaps frame as the eye circles, which costs a redraw the signature
     -- already charges for (FirstPerson.signature) and keeps a card from
     -- fringing against a mirror-flipped record of itself
-    local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip)
+    local frame, mirror = frameFor(def, viewFacing(p), p.phase, p.flip, p.frame)
     local mesh = SpriteBillboards.shadowQuad(def, frame)
     if mesh then
       -- the same pair the camera draw uses, or the sun files a wide card
@@ -1517,6 +1891,7 @@ local function castShadows(state, terrain, nbMesh, posed, cx, cy, vw, vh,
   ShadowMap.sprites(false)
 
   ShadowMap.finish(sig)
+  Perf.add("VoxelScene.castShadows", tSun)
 end
 
 -- Render the world. Without `eyes`, one frame into one canvas -- the flat
@@ -1529,6 +1904,7 @@ end
 local reportedNoMesh = {}
 
 function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
+  local tR = Perf.now()
   -- With nothing cached at all (the first frame of a fresh toggle),
   -- return nil: the engine keeps the 2D path for the frame and
   -- Voxel.ready holds the camera tween at flat, so the switch waits
@@ -1711,10 +2087,70 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   if not Voxel3D.shadowsActive() then
     Voxel3D.beginShadows()
     for _, p in ipairs(posed) do
+      -- the decal is the card squashed onto the ground, so it is the
+      -- SAME frame the lit card and the sun's record use (see statedFrame);
+      -- `stated` rides after `lift` and is nil for every card that names no
+      -- row of its own
       drawShadow(p.sprite, p.px, p.py, viewFacing(p), p.phase, p.flip, p.gh,
-                 p.lift)
+                 p.lift, p.frame)
     end
     Voxel3D.endShadows()
+  end
+
+  -- ------- the staged fight's mons, as a function
+  --
+  -- Standing on their arena cells in THIS eye's view (VR frames only;
+  -- battleTex is nil otherwise). Rebuilt per eye because the cards yaw
+  -- toward the eye that is looking. No wireframe and no glass on them for
+  -- the reasons BattleBillboard and the battle pass each argue: the cards
+  -- are not on the voxel grid, and their texcoords mean nothing to the
+  -- tileset's pane mask. The hit flash rides the same flatten the battle
+  -- pass uses, held short of solid.
+  --
+  -- A FUNCTION, AND DEFINED UP HERE, because it is drawn TWICE -- once into
+  -- the water's reflection copy just below, and once into the frame after
+  -- the cast. It used to be neither: it ran once, inline, after the water,
+  -- so the mons were the one part of the cast with nothing under them on a
+  -- lake. Water's own header has listed "a staged battle's two Pokemon"
+  -- among what the mirror holds since the pass was written; this is the
+  -- code catching up with it. One function for the same reason drawCast is
+  -- one function: two copies of a draw are two copies that can diverge.
+  --
+  -- Asking OverworldBattle for the cards twice in one eye is safe and
+  -- deliberate: monCards is a pure function of the arena, the live textures
+  -- and Voxel3D.eye, and none of the three moves between the two calls
+  -- inside a single eye's drawScene. It advances no timer -- unlike pose(),
+  -- which is why the CAST is posed once and this is not.
+  local function drawBattleCards()
+    if not battleTex then return end
+    local okB, cards = pcall(function()
+      return V.require("OverworldBattle").worldCards()
+    end)
+    if not (okB and cards) then return end
+    local BattleScene = V.require("BattleScene")
+    Voxel3D.glass(false)
+    Voxel3D.seams(false)
+    if battleTex.flash then
+      Voxel3D.flatten(BattleScene.FLASH_COLOR, BattleScene.FLASH_STRENGTH)
+    end
+    for _, card in ipairs(cards) do
+      Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
+                   BattleBillboard.PULL)
+    end
+    if battleTex.flash then Voxel3D.flatten(nil) end
+    -- and the MOVE ANIMATIONS, standing on the same arena: the engine's own
+    -- effects layer on the plane through both cells (BattleScene.fxCard),
+    -- pulled a little harder than the mons so a burst plays over the card
+    -- it is bursting on
+    local okA, fxTex, fxModel = pcall(function()
+      return V.require("OverworldBattle").worldAnim()
+    end)
+    if okA and fxTex and fxModel then
+      Voxel3D.draw(BattleBillboard.mesh(), fxTex, fxModel,
+                   BattleBillboard.PULL + 6)
+    end
+    Voxel3D.seams(true)
+    Voxel3D.glass(true)
   end
 
   -- and the water over the top of it, reflecting everything just drawn plus
@@ -1741,6 +2177,7 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   if #waterDraws > 0 then
     VoxelScene.drawWater(waterDraws, function()
       drawCast(state, posed, atlasFor)
+      drawBattleCards()
     end)
   end
 
@@ -1781,44 +2218,9 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   -- character genuinely behind a building is far deeper and loses the
   -- test, so buildings and trees really occlude.
   drawCast(state, posed, atlasFor)
-  -- The staged fight's mons, standing on their arena cells in THIS eye's
-  -- view (VR frames only; battleTex is nil otherwise). Rebuilt per eye
-  -- because the cards yaw toward the eye that is looking. No wireframe
-  -- and no glass on them for the reasons BattleBillboard and the battle
-  -- pass each argue: the cards are not on the voxel grid, and their
-  -- texcoords mean nothing to the tileset's pane mask. The hit flash
-  -- rides the same flatten the battle pass uses, held short of solid.
-  if battleTex then
-    local okB, cards = pcall(function()
-      return V.require("OverworldBattle").worldCards()
-    end)
-    if okB and cards then
-      local BattleScene = V.require("BattleScene")
-      Voxel3D.glass(false)
-      Voxel3D.seams(false)
-      if battleTex.flash then
-        Voxel3D.flatten(BattleScene.FLASH_COLOR, BattleScene.FLASH_STRENGTH)
-      end
-      for _, card in ipairs(cards) do
-        Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
-                     BattleBillboard.PULL)
-      end
-      if battleTex.flash then Voxel3D.flatten(nil) end
-      -- and the MOVE ANIMATIONS, standing on the same arena: the
-      -- engine's own effects layer on the plane through both cells
-      -- (BattleScene.fxCard), pulled a little harder than the mons so
-      -- a burst plays over the card it is bursting on
-      local okA, fxTex, fxModel = pcall(function()
-        return V.require("OverworldBattle").worldAnim()
-      end)
-      if okA and fxTex and fxModel then
-        Voxel3D.draw(BattleBillboard.mesh(), fxTex, fxModel,
-                     BattleBillboard.PULL + 6)
-      end
-      Voxel3D.seams(true)
-      Voxel3D.glass(true)
-    end
-  end
+  -- and the staged fight's mons over them, exactly as they were painted
+  -- into the water's reflection copy a few lines up (see drawBattleCards)
+  drawBattleCards()
   -- tall grass last, pulled camera-ward exactly as far as the characters
   -- were (same per-vertex shader bias, so grass never drifts either):
   -- relative depth between a walker and the tuft row south of their feet
@@ -1893,7 +2295,9 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
       return nil
     end
     drawScene()
-    return Voxel3D.endScene()
+    local out1 = Voxel3D.endScene()
+    Perf.add("VoxelScene.render", tR)
+    return out1
   end
 
   -- The VR frame: the same scene once per eye, each into its own named
@@ -1913,6 +2317,7 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
     drawScene()
     out[i] = Voxel3D.endScene()
   end
+  Perf.add("VoxelScene.render", tR)
   return out
 end
 

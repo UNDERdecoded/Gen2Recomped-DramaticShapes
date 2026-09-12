@@ -9765,6 +9765,13 @@ function Structures.forMap(map)
       local swap, n = {}, 0
       for cy = math.floor(y0 / 2), math.floor(y1 / 2) do
         for cx = math.floor(x0 / 2), math.floor(x1 / 2) do
+          -- ...AND NEITHER DID THE COMPOSITE SCAN BEFORE IT.
+          --
+          -- Same fault as the gen3Roof pre-pass below and earlier in the
+          -- order, so it is what the profiler saw once that one could
+          -- yield: a whole-grid walk asking `statAt` about every cell and
+          -- the cell north of it, with no tick, 200 ms on Route 119.
+          Budget.tick()
           local st = statAt(cx, cy)
           -- a crown measures 0.93 to 1.00 and IS a tree already; a hedge or
           -- a bush drawn beside a wall carries no above-player layer at all
@@ -9851,6 +9858,21 @@ function Structures.forMap(map)
       local seen = {}
       for ty = y0, y1 do
         for tx = x0, x1 do
+          -- THE FIRST YIELD POINT IN forMap USED TO BE 550 LINES LATER.
+          --
+          -- This pre-pass walks the whole analysed grid -- body plus a
+          -- twelve-tile ring, 31,616 tiles on Route 119 -- asking the Gen 3
+          -- context whether each cell carries a roof, through a pcall per
+          -- CELL. It is the first heavy thing forMap does and it had no
+          -- `Budget.tick()` in it, so the tick-gap profiler recorded 266 ms
+          -- between the start of the analysis and the first tick anywhere:
+          -- a quarter of a second of frozen frame before the budget could
+          -- suspend anything at all.
+          --
+          -- A tick reads the clock every 32nd call and yields only when the
+          -- slice is spent, so on a synchronous caller (the offline tools,
+          -- the relief harness, a probe) it does nothing whatsoever.
+          Budget.tick()
           local cx, cy = math.floor(tx / 2), math.floor(ty / 2)
           local ck = cy * 8192 + cx
           local hit = seen[ck]
@@ -12538,6 +12560,22 @@ local function roundTemplate(S, map, data, cx, cy, groundTiles, N, capRows,
   local quads = {}
 
   for iy = 0, NY - 1 do
+    -- A WHOLE TREE IS BUILT BETWEEN TWO TICKS.
+    --
+    -- `roundTemplate` carves a round hull out of a drawing per PIXEL and
+    -- emits its exposed faces -- 130 to 330 quads for one 8x8 tile -- and
+    -- from the top of this function to the bottom there was no
+    -- `Budget.tick()` anywhere. The scenery carve that calls it ticks once
+    -- per CELL, so the profiler saw single iterations of that loop running
+    -- 60 ms: one iteration, one hull, one unbroken block of work.
+    --
+    -- This is the emission loop and it runs once per canvas row (16 rows
+    -- for a one-cell hull, 48 for Mossdeep's 3x3 trees), so a tick here
+    -- breaks the hull into slices of a few milliseconds. It is the only
+    -- tick added inside the template: the mask, flood and disc passes above
+    -- are all O(NX*NY) over at most 2,304 pixels and none of them showed in
+    -- the profile.
+    Budget.tick()
     if loRow[iy] then
       local yB, yT = NY - 1 - iy, NY - iy
 

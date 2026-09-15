@@ -233,6 +233,191 @@ return {
     },
   },
 
+  -- ---------------------------------------------------------------------------
+  -- BASINS -- A FOUNTAIN IS A RING IN PLAN, AND ITS PLAN IS WHAT IS DRAWN
+  -- ---------------------------------------------------------------------------
+  --
+  -- (g3-basin-311.)  MOTIVATED BY THE WATER FOUNTAIN IN THE MIDDLE OF
+  -- RUSTBORO CITY -- RustboroCity (27..29, 38..40), the 3x3 island of paving
+  -- in the square outside the Pokemon Center.  Nine metatiles, laid once each,
+  -- and it renders today as a lumpy low slab: the height field over its six
+  -- tile columns reads 16 16 32 32 16 16 with four SKIP tiles along its south
+  -- edge, on a street that is itself 16.  A kerb one course high with a bite
+  -- out of one corner, and no water in it anywhere.
+  --
+  -- WHY THIS IS AUTHORED, AND WHY THE PREVIOUS REFUSAL WAS RIGHT TO REFUSE.
+  -- The object crosses all nine cells and its edge is a CURVE that cuts them
+  -- diagonally, so no per-cell height class can describe it -- a class gives
+  -- one height to a whole cell, and the corner cells are part fountain and
+  -- part street.  That refusal asked for four numbers Emerald does not state,
+  -- and those four numbers are now supplied; they are the only stated numbers
+  -- in this figure and each is marked STATED below.  Everything else is
+  -- DERIVED, measured off the drawing, and the measurements are here.
+  --
+  -- THE DRAWING IS A PLAN, AND IT IS AN EXACT OCTAGON.  Composited over the
+  -- nine metatiles the art is a 48x48 block; carved against this map's own
+  -- floor colours (Gen3.shapeDataForMap) its silhouette is:
+  --
+  --     rows  0.. 1   nothing
+  --     row      2    x 11..36      the north edge, 26 across
+  --     rows  3..11   widening one pixel a side a row   the north chamfers
+  --     rows 12..33   x  1..46      the east and west edges, 22 rows
+  --     rows 34..45   narrowing one pixel a side a row  the south chamfers
+  --     row     45    x 13..34      the south edge, 22 across
+  --
+  -- and the octagon `|x-23.5| <= 22.5 and |z-23.5| <= 22.5 and the two summed
+  -- <= 34` reproduces rows 2..33 of that TEXEL FOR TEXEL -- THIRTY-TWO of the
+  -- forty-four drawn rows, both north chamfers and both straight sides, every
+  -- one EXACT.  It differs nowhere else except by FORESHORTENING, and by one
+  -- pixel at the north edge and two at the south: the near kerb's own front
+  -- face is the one place in this drawing where a row is height rather than
+  -- depth, and it costs the plan two rows out of forty-four.
+  --
+  -- So the refusal's "the art is a PLAN, not an elevation" is exactly right
+  -- and is the reason this works: a plan is what a ring wants.  What could not
+  -- be done was to put a plan through a per-cell height class.  Stating the
+  -- plan as a polygon and standing it costs no classifier and no threshold.
+  --
+  -- WHAT AN ENTRY SAYS:
+  --
+  --   block    the metatiles the figure is drawn on, as a w x h block, row
+  --            major.  The pass requires all of them, laid in that shape, and
+  --            builds nothing anywhere they are not.
+  --   outer    the kerb's OUTER plan, as a half-extent and an L1 (diagonal)
+  --            limit about the block's own centre.  Both DERIVED above.
+  --   inner    the water's plan -- the same octagon inset by the kerb's width.
+  --   jet      the spout's plan radius, about the same centre.
+  --   kerb     how high the kerb stands on the street.  STATED.
+  --   water    where the water surface sits.  STATED.
+  --   crown    where the jet tops out.  STATED.
+  --   face     the moulding PROFILE: one drawn column and the drawn rows that
+  --            are the kerb's front face, read bottom-up, one drawn row per
+  --            world pixel.  Same contract as a paling's `face`.
+  --   lip      the drawn rows that are the INSIDE of the kerb, above water.
+  --   plume    the drawn rows that are the jet's own body.
+  --
+  -- Every horizontal surface -- the kerb's top, the water, the jet's crown --
+  -- wears the drawing's own texel at that plan position, 1:1, because the
+  -- drawing IS the plan.  Nothing is stretched and nothing is repeated; the
+  -- one exception is called out in Structures.buildGen3Basins and is a single
+  -- pixel of rim.
+  basins = {
+    -- RUSTBORO CITY'S FOUNTAIN.  These nine metatiles on THIS PAIR are the
+    -- fountain and nothing else: swept over all 518 maps, pair
+    -- TILESET_03DF704_03DF734 (gTileset_General over gTileset_Rustboro) lays
+    -- 824/825/826/832/833/834/840/841/842 exactly NINE TIMES IN HOENN, all
+    -- nine on RustboroCity, one cell each -- this fountain.  The seven other
+    -- maps built on gTileset_Rustboro (Route104, Route104_Prototype,
+    -- Route116, PetalburgWoods, FarawayIsland_Entrance, SouthernIsland_
+    -- Exterior and SouthernIsland_Interior) place none of them.
+    --
+    -- METATILE IDS ARE PER PAIR and these nine numbers are busy elsewhere:
+    -- 1,187 other cells in Hoenn carry one of them on some OTHER pair, and
+    -- the same 3x3 block of ids is SLATEPORT'S MOORED SAILING BOAT on
+    -- TILESET_03DF704_03DF764, twenty rows above this one in this very file.
+    -- Keying on the pair is therefore not a convenience, it is the whole
+    -- correctness argument, and it is why there is no map id anywhere here.
+    ["TILESET_03DF704_03DF734"] = {
+      figures = {
+        {
+          name = "rustboro city fountain",
+          block = {
+            w = 3, h = 3,
+            meta = { 824, 825, 826,
+                     832, 833, 834,
+                     840, 841, 842 },
+          },
+
+          -- THE KERB'S OUTER PLAN.  DERIVED: `half` is the drawn silhouette's
+          -- own east and west edges, x = 1 and x = 46 on all twenty-two rows
+          -- 12..33, about the block centre 23.5.  `diag` is the chamfer: the
+          -- north edge runs x 11..36 on row 2, and 12.5 + 21.5 = 34.  Checked
+          -- against every drawn row -- exact on all of 2..33.
+          outer = { half = 22.5, diag = 34 },
+
+          -- THE WATER'S PLAN, and it is the outer octagon inset by the kerb.
+          -- DERIVED: on the thirteen rows 14..26 the drawing measures exactly
+          -- SEVEN stone pixels from the silhouette to the first water pixel,
+          -- on BOTH sides, every row -- so the kerb is 7 across and
+          -- 22.5 - 7 = 15.5.  The water's own north chamfer then satisfies
+          -- dx + dz = 25 EXACTLY on rows 7..12, which is where `diag` comes
+          -- from; it is not 34 - 7*sqrt(2) = 24.1 and it is not fitted, it is
+          -- read.  (The kerb is thus a shade narrower across a chamfer than
+          -- across a flat, 6.4 against 7, which is what the artist drew.)
+          inner = { half = 15.5, diag = 25 },
+
+          -- THE SPOUT'S PLAN.  DERIVED: the stone island in the middle of the
+          -- water measures 12 across (x 18..29) on row 25, and the two rows
+          -- below it measure 8 and 4 -- that is one disc's own foreshortened
+          -- front edge, not a taper -- so the spout is a disc of radius 6 on
+          -- the block's own centre.  Row 27's four pixels are x 22..25, whose
+          -- midpoint is 23.5: the drawing puts the spout dead centre.
+          jet = { radius = 6 },
+
+          -- ---- THE FOUR STATED NUMBERS, AND THEY ARE THE ONLY ONES -------
+          --
+          -- Emerald states no height for this object anywhere.  These four
+          -- are supplied, not measured, and are marked so here and again at
+          -- every use in Structures.buildGen3Basins.
+          --
+          -- kerb = 12   STATED.  The walker is 32 tall; this mod's furniture
+          --             vocabulary is 8 = knee (32/4) and 16 = waist (32/2),
+          --             and a public fountain kerb sits between them -- at
+          --             the same 12 this mod ALREADY states for `tabletop`
+          --             in JOINERY_H (lib/Structures.lua).  Reusing a number
+          --             the mod already stands by rather than inventing one.
+          -- steps = 1   STATED.  One kerb course.  The drawing shows a single
+          --             moulded rim, not a tiered plinth, and the pass
+          --             refuses any other value rather than guessing at what
+          --             a second course would be made of.
+          -- water = 9   STATED, as kerb 12 less a drop of 3.  Deep enough to
+          --             read as water held in a basin, shallow enough that
+          --             the basin does not look empty from a low camera.
+          -- crown = 19  STATED, as water 9 plus a jet of 10 -- below kerb
+          --             plus half a walker, so it never occludes the player's
+          --             head.  CORROBORATED, and this is the only check the
+          --             drawing can offer: the central stone runs drawn rows
+          --             8..27, twenty rows, against a stated 19.  One pixel.
+          kerb  = 12,
+          steps = 1,
+          water = 9,
+          crown = 19,
+
+          -- THE MOULDING, as a PROFILE: one drawn column, read bottom-up, one
+          -- drawn row per world pixel.  DERIVED: column 24 is the block's own
+          -- centre, where the near kerb is seen square-on and nothing stands
+          -- in front of it, and rows 35..45 are its whole drawn front face --
+          -- dark lip, two light courses, the shadowed astragal, and the
+          -- ground line.  ELEVEN rows for a kerb stated at twelve; the pass
+          -- does NOT stretch them to fit (see its note on the twelfth pixel).
+          -- All eight faces of the ring wear this one profile, which is a
+          -- rotation and not a smear: an octagonal kerb is the same moulding
+          -- the whole way round, and the paling's log post is read the same
+          -- way for the same reason.
+          face = { col = 24, y0 = 35, y1 = 45 },
+
+          -- THE INSIDE OF THE KERB, the three pixels of it that stand above
+          -- the water.  DERIVED: rows 5..7 of column 24 are the only place in
+          -- the drawing where the inside of the ring is drawn at all -- the
+          -- far kerb's dark inner lip, its grey wall, and the waterline --
+          -- and there are exactly three of them, which is exactly the stated
+          -- drop.  Read top-down: row 5 is the lip at y = 11, row 7 the
+          -- waterline at y = 9.
+          lip = { col = 24, y0 = 5, y1 = 7 },
+
+          -- THE JET'S BODY.  DERIVED: rows 18..27 of column 24 -- TEN drawn
+          -- rows, which is exactly the ten world pixels the stated crown asks
+          -- for, so this maps 1:1 with nothing left over and nothing
+          -- repeated.  Row 27 is the spout's foot at the waterline (y = 9)
+          -- and row 18 its head (y = 18).  The rows above 18 are the plume's
+          -- highlights and are what the jet's LID wears, in plan, from the
+          -- drawing's own texels.
+          plume = { col = 24, y0 = 18, y1 = 27 },
+        },
+      },
+    },
+  },
+
   overhead = {
     -- (the hull figures above are a different statement: those name a whole
     --  drawing and where a composite block places copies of it; these name

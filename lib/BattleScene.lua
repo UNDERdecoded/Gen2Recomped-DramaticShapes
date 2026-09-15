@@ -40,10 +40,6 @@ local TerrainAtlas = V.require("TerrainAtlas")
 local VoxelScene = V.require("VoxelScene")
 local BattleCam = V.require("BattleCam")
 local BattleBillboard = V.require("BattleBillboard")
-local StadiumModels = V.require("StadiumModels")
-local BattleArt = V.require("BattleArt")
-local UiBackplates = V.require("UiBackplates")
-local BackdropImage = V.require("BackdropImage")
 local VoxelGrid = V.require("VoxelGrid")
 local DayNight = V.require("DayNight")
 local AntiAlias = V.require("AntiAlias")
@@ -281,16 +277,6 @@ local function monCards(arena, groundY, textures)
     local cell = (side == "player") and arena.player or arena.enemy
     if tex and tex.canvas and cell then
       local mirror = (side == "player") and not tex.trainer
-                     and not tex.noMirror
-      if not BattleScene._mirrorTrace then
-        BattleScene._mirrorTrace = true
-        local okL, L = pcall(require, "src.core.Logger")
-        if okL and L then
-          L.warn("[BATTLE_ART_VOXEL_GEN2] mirror player=%s trainer=%s noMirror=%s flips=%s",
-            tostring(side == "player"), tostring(tex.trainer),
-            tostring(tex.noMirror), tostring(BattleArt.flipsPlayerFront()))
-        end
-      end
       out[#out + 1] = { tex = tex.canvas,
                         model = monMatrix(tex, cell[1], groundY, cell[2],
                                           mirror) }
@@ -305,13 +291,20 @@ BattleScene.monCards = monCards
 -- eye, for the GB-frame effects texture OverworldBattle.animTexture
 -- renders (the engine's own drawAnimLayer, caught on a canvas).
 --
--- Effects are 2D drawings like the pics, so the frame faces the viewing eye
--- and stays upright. Its horizontal scale pins both slot columns to their
--- cells; any perspective-only vertical mismatch is shared between the two
--- sides instead of shearing the pixels, which made a Poké Ball look tilted.
+-- Effects are 2D drawings like the pics, and the pics' answer holds for
+-- them too: a drawing must FACE the eye that is looking (the mon cards
+-- yaw toward it per eye -- see monMatrix). So the frame stands on the
+-- arena's midpoint, yawed at the eye like the cards are, and the classic
+-- layout's two slot marks are pinned where each CELL lands on that plane
+-- along this very eye's own ray -- so from the eye that is looking, a
+-- burst authored at a slot sits exactly over the mon standing in for it,
+-- and a projectile crossing the frame crosses the arena. The vertical
+-- scale is the mon cards' own (FULL_W / FULL_PIC), so an effect is sized
+-- like the pics it plays over.
 --
--- An eye nearly on the arena axis makes the two projected columns converge;
--- that case uses a centred fixed-scale card rather than turning edge-on.
+-- An eye standing (nearly) ON the arena's axis sees the two cells in
+-- line and the pinning degenerates; the frame then falls back to the
+-- fixed plane through both cells, which that eye views edge-on anyway.
 --
 -- Reads Voxel3D.eye at CALL time, like the cards -- call it per eye.
 -- Returns the model matrix for BattleBillboard's unit card (x -0.5..0.5,
@@ -351,16 +344,7 @@ function BattleScene.fxCard(arena, groundY, anchors)
   local eax, eay = inPlane(Ex, Ey, Ez)
 
   if math.abs(eax - pax) < 4 then
-    if eye then
-      local mx = (p[1] + e[1]) / 2
-      local my = (p[2] + e[2]) / 2
-      local ox = s * (0.5 * GW - mx)
-      return { rx * s * GW, 0, nx, Mx + rx * ox,
-               0, s * GH, 0, My + s * (my - GH),
-               rz * s * GW, 0, nz, Mz + rz * ox,
-               0, 0, 0, 1 }
-    end
-    -- Headless fallback: the fixed plane through both cells.
+    -- edge-on: the fixed plane through both cells, world-axis mapping
     local ux = (Ex - Px) / dgb
     local uy = (Ey - Py - s * (p[2] - e[2])) / dgb
     local uz = (Ez - Pz) / dgb
@@ -376,14 +360,12 @@ function BattleScene.fxCard(arena, groundY, anchors)
              0, 0, 0, 1 }
   end
 
-  -- In-plane travel per GB pixel of frame x pins both slot columns:
+  -- in-plane travel per GB pixel of frame x, solved so both marks land:
   -- inPlane(gb) = (pax, pay) + U * (gbx - p.x) + (0, s) * (p.y - gby)
   local ux = (eax - pax) / dgb
-  local verticalResidual = eay - pay - s * (p[2] - e[2])
-  local uy = eye and 0 or verticalResidual / dgb
+  local uy = (eay - pay - s * (p[2] - e[2])) / dgb
   local cxp = pax + ux * (0.5 * GW - p[1])
-  local yBias = eye and verticalResidual / 2 or 0
-  local cyp = pay + yBias + uy * (0.5 * GW - p[1]) + s * (p[2] - GH)
+  local cyp = pay + uy * (0.5 * GW - p[1]) + s * (p[2] - GH)
   return { rx * ux * GW, 0, nx, Mx + rx * cxp,
            uy * GW, s * GH, 0, My + cyp,
            rz * ux * GW, 0, nz, Mz + rz * cxp,
@@ -422,9 +404,6 @@ local function shadowSignature(state, arena, terrain, nbMesh, token, cards)
   local host = arena.map or state.map
   local parts = { "battle", host.id, arena.x, arena.y, arena.shape,
                   tostring(terrain), tostring(token or 0),
-                  -- SPRITE LIGHT changes whether the mons cast at all, so a
-                  -- cached map must be re-cast when it flips.
-                  tostring(UiBackplates.spritesUnlit()),
                   -- the cycle keeps running through a fight, and an arena lit
                   -- from somewhere new must be re-cast from there
                   math.floor(ShadowMap.KX * 128),
@@ -474,16 +453,12 @@ local function castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh,
   -- marked as the CAST, so a fight staged at the water's edge does not lay a
   -- cut-out of a Pokemon across the lake (see ShadowMap.sprites); the arena's
   -- own floor still takes them, which is the shadow that matters here
-  -- SPRITE LIGHT: UNLIT cards cast no ground shadow either, or the sun pass
-  -- would still paint one under a mon drawn full bright (see the card pass).
-  if not UiBackplates.spritesUnlit() then
-    ShadowMap.sprites(true)
-    for _, card in ipairs(cards or {}) do
-      ShadowMap.draw(BattleBillboard.mesh(), card.tex,
-                     ShadowMap.snug(card.model))
-    end
-    ShadowMap.sprites(false)
+  ShadowMap.sprites(true)
+  for _, card in ipairs(cards or {}) do
+    ShadowMap.draw(BattleBillboard.mesh(), card.tex,
+                   ShadowMap.snug(card.model))
   end
+  ShadowMap.sprites(false)
 
   ShadowMap.finish(sig)
 end
@@ -545,25 +520,6 @@ BattleScene.FLASH_STRENGTH = 0.5
 -- one place that means "a staged battle is drawing this frame, and the
 -- overworld is not". From the update hook the condition would have to be
 -- guessed at, and a frame where both ran would double the rate.
--- SPRITE LIGHT: UNLIT needs per-draw uniform sends. This fork's Voxel3D
--- sends dayTint/sunDark once per beginScene, so the card pass re-sends them
--- itself (the shader stays bound, so mid-scene sends land) and restores the
--- scene values afterwards.
-local function setUnlit(on)
-  -- beginScene binds the wireframe variant whenever V-GRID is enabled, so
-  -- send to whichever shader this pass is actually using.
-  local sh = Voxel3D.shader(VoxelGrid.enabled())
-  if not sh then return end
-  if on then
-    pcall(sh.send, sh, "dayTint", { 1, 1, 1 })
-    pcall(sh.send, sh, "sunDark", 0)
-  else
-    pcall(sh.send, sh, "dayTint", Voxel3D.tint or { 1, 1, 1 })
-    pcall(sh.send, sh, "sunDark",
-          ShadowMap.active() and Voxel3D.SHADOW_ALPHA or 0)
-  end
-end
-
 local function tickTiles()
   local Game = require("src.core.Game")
   local ow = Game and Game.overworld
@@ -575,13 +531,7 @@ local function tickTiles()
   pcall(require("src.render.TileRenderer").tick)
 end
 
-function BattleScene.render(state, arena, textures, token, battle, animTex,
-                            animAnchors)
-  -- The Stadium 2 importer keys its model instances to the live battle (a
-  -- mid-fight Transform or a shiny flip swaps the instance); nil battle just
-  -- means the placements come back empty and the sprite cards stand.
-  StadiumModels.sync(battle)
-  StadiumModels.update(battle)
+function BattleScene.render(state, arena, textures, token)
   if not (state and state.map and arena) then return nil end
   if not Voxel3D.available() then return nil end
   tickTiles()
@@ -590,10 +540,6 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
   -- another floor of the same cave or building (see BattleArena)
   local host = arena.map or state.map
   local neighbors = (host == state.map) and (state.neighbors or {}) or {}
-  local whiteFill = UiBackplates.arenaWhite()
-  local artImage = UiBackplates.arenaPng()
-                   and BackdropImage.load("bosses", "arena.png") or nil
-  local flatFill = whiteFill or artImage ~= nil
 
   -- the hour's light reaches the arena exactly as it reaches free-roam: the
   -- shared rig follows the clock on an outdoor floor and stays at noon on an
@@ -613,11 +559,8 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
 
   -- shares the free-roam mode's request/evict bookkeeping, so a battle warms
   -- exactly the meshes walking around would have and nothing extra
-  local terrain, nbMesh, water, nbWater
-  if not flatFill then
-    terrain, nbMesh, water, nbWater = prefetchArena(state, host)
-    if not terrain then return nil end
-  end
+  local terrain, nbMesh, water, nbWater = prefetchArena(state, host)
+  if not terrain then return nil end
 
   local lx, ly, s, pw, ph = BattleScene.letterbox()
   if not (pw > 0 and ph > 0 and s > 0) then return nil end
@@ -647,17 +590,9 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
   Voxel3D.camera = cam
   Voxel3D.viewProjection(cx, cy, vw, vh)
   local cards = monCards(arena, groundY, textures)
-  -- The Stadium 2 importer's models, when connected: one placement per side,
-  -- replacing only that side's sprite card. Computed before the scene opens
-  -- so a model failure can still fall back to the card below.
-  local stadium = StadiumModels.placements(arena, groundY, textures, battle)
   Voxel3D.camera = nil
-  if flatFill then
-    ShadowMap.discard()
-  else
-    castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh, atlasFor,
-                cards, token, host, neighbors, water, nbWater)
-  end
+  castShadows(state, arena, terrain, nbMesh, cx, cy, vw, vh, atlasFor,
+              cards, token, host, neighbors, water, nbWater)
 
   -- An opaque void either way. Outdoors the camera is low enough that the
   -- horizon is genuinely in frame, so it is sky; indoors it is the dark end
@@ -675,10 +610,13 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
   local sunWas = Voxel3D.SHADOW_ALPHA
   Voxel3D.SHADOW_ALPHA = BattleScene.SHADOW_ALPHA
                          * DayNight.shadowScale(outdoor)
-  -- The same V-GRID row owns free roam and battles. beginScene reads it live,
-  -- so OFF produces a clean arena and ON keeps the constructed wireframe.
+  -- and the wireframe is ON for a battle whatever the V-GRID row says. The
+  -- arena is a staged shot rather than the world being walked through, and
+  -- the seams are what make it read as built rather than photographed. Forced
+  -- through the override so the player's own row is never written to.
+  local gridWas = VoxelGrid.override
+  VoxelGrid.override = true
   local out = nil
-  local animInWorld = false
   local ok, err = pcall(function()
     -- its own canvas slot: this renders at the window's pixel size and the
     -- free-roam pass does too, but the two are alive at different moments
@@ -692,20 +630,14 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
     -- pw and ph, and why the HUDs and the depth of field, drawn onto the
     -- folded canvas afterwards, stay the chunky GB art they are.
     local rw, rh = AntiAlias.expand(pw, ph)
-    local skyFill = whiteFill and { 1, 1, 1 }
-                    or (artImage and { 0, 0, 0 } or sky)
-    if not Voxel3D.beginScene(rw, rh, cx, cy, vw, vh, skyFill, "battle") then
+    if not Voxel3D.beginScene(rw, rh, cx, cy, vw, vh, sky, "battle") then
       return
     end
-    if artImage then
-      Voxel3D.backdrop(artImage, UiBackplates.backdropOffsetPixels())
+    Voxel3D.draw(terrain, atlasFor(host), nil)
+    for i, nb in ipairs(neighbors) do
+      Voxel3D.draw(nbMesh[i], atlasFor(nb.map),
+                   Mat4.translate(nb.ox, 0, nb.oy))
     end
-    if not flatFill then
-      Voxel3D.draw(terrain, atlasFor(host), nil)
-      for i, nb in ipairs(neighbors) do
-        Voxel3D.draw(nbMesh[i], atlasFor(nb.map),
-                     Mat4.translate(nb.ox, 0, nb.oy))
-      end
     -- and the water over it -- PLAIN, always: the flat animated tiles, never
     -- the reflective pass, whatever the WATER row says. The reflection is
     -- tuned for the overworld's ladder of cameras; this shot's is PLACED --
@@ -715,12 +647,11 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
     -- the tile art. The battle is a stage set, and stage water is painted.
     -- (No mirror also means the mons need no second draw into one -- they
     -- just composite over the water below, like everything else on the set.)
-      if water then Voxel3D.draw(water, atlasFor(host)) end
-      for i, nb in ipairs(neighbors) do
-        if nbWater and nbWater[i] then
-          Voxel3D.draw(nbWater[i], atlasFor(nb.map),
-                       Mat4.translate(nb.ox, 0, nb.oy))
-        end
+    if water then Voxel3D.draw(water, atlasFor(host)) end
+    for i, nb in ipairs(neighbors) do
+      if nbWater and nbWater[i] then
+        Voxel3D.draw(nbWater[i], atlasFor(nb.map),
+                     Mat4.translate(nb.ox, 0, nb.oy))
       end
     end
     -- The mons, standing on their tiles. Depth-tested like everything else,
@@ -745,85 +676,32 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
     -- and no glass either: the cards wear the battle screen, not the
     -- tileset atlas, so the mask's coordinates mean nothing on them
     Voxel3D.glass(false)
-    -- Trainers aside, an available model replaces only its own side's card;
-    -- a side without a placement keeps the exact established card path.
-    -- SPRITE LIGHT: UNLIT draws the card flat and full bright -- no sun-map
-    -- shadow (nil snug) and no hour tint, so night or a cave does not dim
-    -- it. SHADED (the default) keeps both, as intended.
-    local unlit = UiBackplates.spritesUnlit()
-    if unlit then setUnlit(true) end
-
     for _, card in ipairs(monCards(arena, groundY, textures)) do
-      if not StadiumModels.uses(stadium, card.side) then
-        -- the sun stored this card snugged (castShadows), so its own shadow
-        -- lookup must read the same snugged transform -- see ShadowMap.snug
-        local sunModel = not unlit and ShadowMap.snug(card.model) or nil
-        Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
-                     BattleBillboard.PULL, sunModel)
-      end
-    end
-    -- The models themselves: two passes over the placements, with a per-side
-    -- fallback so a provider failure cannot strand a missing battler.
-    local failedModels = {}
-    local drawContext = {
-      viewProjection = Voxel3D.vp,
-      view = Mat4.lookAt(Voxel3D.eye, Voxel3D.focus,
-        (cam and cam.up) or { 0, 1, 0 }),
-      tint = Voxel3D.tint,
-      light = {
-        direction = { 0.35, 0.7, 0.62 },
-        ambient = { 0.46, 0.46, 0.46 },
-        diffuse = { 0.72, 0.72, 0.72 },
-      },
-      flashing = flashing,
-    }
-    for _, pass in ipairs({ "opaque", "additive" }) do
-      for side, placement in pairs(stadium or {}) do
-        if not failedModels[side]
-            and not StadiumModels.draw(placement, drawContext, pass) then
-          failedModels[side] = true
-        end
-      end
-    end
-    if failedModels.player or failedModels.enemy then
-      for _, card in ipairs(monCards(arena, groundY, textures)) do
-        if failedModels[card.side] then
-          local sunModel = not unlit and ShadowMap.snug(card.model) or nil
-          Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
-                       BattleBillboard.PULL, sunModel)
-        end
-      end
-    end
-    if unlit then setUnlit(false) end
-    if flashing then Voxel3D.flatten(nil) end
-    local fxModel = animTex and animAnchors
-                    and BattleScene.fxCard(arena, groundY, animAnchors)
-    if fxModel then
-      Voxel3D.draw(BattleBillboard.mesh(), animTex, fxModel,
-                   BattleBillboard.PULL + 6)
-      animInWorld = true
+      -- the sun stored this card snugged (castShadows), so its own shadow
+      -- lookup must read the same snugged transform -- see ShadowMap.snug
+      Voxel3D.draw(BattleBillboard.mesh(), card.tex, card.model,
+                   BattleBillboard.PULL, ShadowMap.snug(card.model))
     end
     Voxel3D.glass(true)
     Voxel3D.seams(true)
+    if flashing then Voxel3D.flatten(nil) end
     -- grass and flowers ride the same camera-ward pull the free-roam pass
     -- gives them, measured against THIS camera's pitch rather than the
     -- orbit's -- there is no character here for them to overdraw, but the
     -- pull is also what keeps a tuft from z-fighting the floor it stands on
-    if not flatFill then
-      local pull = VoxelScene.pull(math.max(pitch, 0.05))
-      Voxel3D.draw(ChunkMesher.grass(host), atlasFor(host), nil, pull)
-      for _, nb in ipairs(neighbors) do
-        Voxel3D.draw(ChunkMesher.grass(nb.map), atlasFor(nb.map),
-                     Mat4.translate(nb.ox, 0, nb.oy), pull)
-      end
-      local fpull = math.max(0, pull - 8 * math.sin(math.max(pitch, 0.05)))
-      Voxel3D.draw(ChunkMesher.flowers(host), atlasFor(host), nil, fpull,
-                   ShadowMap.snug(nil))
-      for _, nb in ipairs(neighbors) do
-        Voxel3D.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
-                     Mat4.translate(nb.ox, 0, nb.oy), fpull,
-                     ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
-      end
+    local pull = VoxelScene.pull(math.max(pitch, 0.05))
+    Voxel3D.draw(ChunkMesher.grass(host), atlasFor(host), nil, pull)
+    for _, nb in ipairs(neighbors) do
+      Voxel3D.draw(ChunkMesher.grass(nb.map), atlasFor(nb.map),
+                   Mat4.translate(nb.ox, 0, nb.oy), pull)
+    end
+    local fpull = math.max(0, pull - 8 * math.sin(math.max(pitch, 0.05)))
+    Voxel3D.draw(ChunkMesher.flowers(host), atlasFor(host), nil, fpull,
+                 ShadowMap.snug(nil))
+    for _, nb in ipairs(neighbors) do
+      Voxel3D.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map),
+                   Mat4.translate(nb.ox, 0, nb.oy), fpull,
+                   ShadowMap.snug(Mat4.translate(nb.ox, 0, nb.oy)))
     end
     local canvas = AntiAlias.resolve(Voxel3D.endScene(), pw, ph, "battle")
     if not canvas then return end
@@ -853,7 +731,6 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
       enemy = { emx, emy },
       playerSpan = math.abs(pr - pl),
       enemySpan = math.abs(er - el),
-      animInWorld = animInWorld,
       -- the letterbox, so the depth-of-field pass can put its sharp band on
       -- the two marks rather than on a fraction of the window
       lx = lx, ly = ly, scale = s, pw = pw, ph = ph,
@@ -868,6 +745,7 @@ function BattleScene.render(state, arena, textures, token, battle, animTex,
   -- renders (the free-roam pipeline, next frame) must find the orbit back
   Voxel3D.camera = nil
   Voxel3D.SHADOW_ALPHA = sunWas
+  VoxelGrid.override = gridWas
   if not ok then
     -- endScene never ran, so the canvas is still bound and the shader still
     -- set; put the frame back the way it was found before rethrowing

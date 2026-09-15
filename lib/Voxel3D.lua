@@ -73,6 +73,29 @@ Voxel3D.FACE_SHADE = {
 local SHADER = [[
   varying float vShade;
   varying vec3 vSun;          // this fragment's place in the sun's view
+  // HOW FAR THIS VERTEX STOOD ABOVE THE MIRROR PLANE, before it was
+  // reflected in it -- see `mirror` below and Voxel3D.beginPlanar.
+  //
+  // Declared unconditionally rather than behind a compile flag, because the
+  // planar pass is a per-FRAME decision while the shader is compiled once
+  // per session: a second variant would double the compile surface -- and
+  // the number of drivers that can refuse one -- to save a single
+  // interpolated float on a stage that already carries four. It is inert on
+  // every ordinary draw (with `mirror.x` at 0 nothing reads it), so Gen 1,
+  // Gen 2 and Prism, which never open a planar pass, are shaded by exactly
+  // the instructions they were before it existed.
+  //
+  // PRECISION IS STATED, not defaulted, for the reason the water shader's
+  // own header gives at length: GLSL ES defaults the fragment stage to
+  // mediump and the vertex stage to highp, and it REFUSES TO LINK a name the
+  // two stages qualify differently -- which is not a wrong picture but no
+  // scene shader at all, and this mod's whole 3D pass with it.
+  varying LOVE_HIGHP_OR_MEDIUMP float vAbove;
+  // ...and the plane itself, declared OUT HERE rather than inside the vertex
+  // block because BOTH stages read it: the vertex stage flips the geometry
+  // in it, the fragment stage clips on it. Same precision rule as the
+  // varying above, and the same consequence for getting it wrong.
+  uniform LOVE_HIGHP_OR_MEDIUMP vec2 mirror;
 #ifdef VOXEL_GRID
   // model space, one unit per voxel -- see VoxelGrid. Precision matters
   // here in a way it does not for a colour: the seam is the FRACTIONAL
@@ -88,6 +111,27 @@ local SHADER = [[
   uniform vec3 eye;
   uniform float pull;
   uniform vec3 curve;         // xy = the focus in world XZ, z = k; 0 = off
+  // THE PLANAR REFLECTION PASS reads `mirror` (declared at the top of this
+  // shader, because the fragment stage clips on it too): x = 0 off, 1 on;
+  // y = the plane's world Y.
+  //
+  // THE MIRRORED FRAME IS DRAWN BY REFLECTING THE GEOMETRY, not by
+  // reflecting the camera. The two are the same picture on a flat world and
+  // they are NOT the same picture under the world curve, which is the one
+  // this mode draws. The bend drops a vertex by the square of its column's
+  // distance from the focus (below), so it is a function of world XZ alone:
+  // reflecting a vertex's Y leaves its XZ exactly where it was, and the
+  // bend that then rides on top is the SAME displacement the real geometry
+  // took. A reflected CAMERA would instead bend a world that is already
+  // upside down, where the drop pulls a reflection further from the surface
+  // the further it stands from the eye -- the far bank sliding out of its
+  // own reflection.
+  //
+  // So: reflect in the FLAT world, then bend. That is the identical rule
+  // the water shader keeps for what it reflects (see Water's SHADER_SRC --
+  // the reflection is taken with the flat view ray about the flat normal,
+  // and only the MARCH walks the world as drawn), and written this way the
+  // two cannot drift apart, because they are now the same sentence.
   attribute float VertexShade;
   vec4 position(mat4 transform_projection, vec4 vertex_position) {
     vShade = VertexShade;
@@ -98,6 +142,23 @@ local SHADER = [[
     vGrid = vertex_position.xyz;
 #endif
     vec4 w = model * vertex_position;
+    // ...and reflected in the water plane, for the length of the planar
+    // pass. ABOVE the shadow lookup deliberately: the sun lit the world the
+    // right way up, and the reflection of a lit thing is that lit thing seen
+    // in a mirror -- so the lookup has to go on asking where the UPRIGHT
+    // vertex stood. That is the same reason the character lean asks with
+    // `sunModel` rather than `model` two lines below.
+    //
+    // `vAbove` is the signed height the vertex had BEFORE the flip, and it
+    // is what the fragment stage clips on: anything that was UNDER the water
+    // is not in the water's reflection, and mirrored it comes up ABOVE the
+    // plane and shows through the surface as a drowned copy of the lake bed.
+    // IN-GAME: the sea floor under Lilycove's harbour, and the two-pixel lip
+    // the water class recesses every shoreline into.
+    vAbove = w.y - mirror.y;
+    if (mirror.x > 0.5) {
+      w.y = 2.0 * mirror.y - w.y;
+    }
     // The shadow lookup runs off `sunModel`, not `model`. For terrain the
     // two are the same matrix, but a character is drawn as a slab LEANING
     // back by the camera's pitch -- a trick played on the viewer, which
@@ -214,6 +275,27 @@ local SHADER = [[
   uniform float glassOn;      // 0 for sprite-sheet draws (see Voxel3D.glass)
 
   vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+    // THE MIRROR'S CLIP PLANE. Only what stood ABOVE the water is in the
+    // water, so everything that stood below it is thrown away here rather
+    // than drawn upside down into the reflection -- where, flipped, it would
+    // come up above the plane and read as terrain showing THROUGH the
+    // surface. Done as a fragment discard rather than a real clip plane
+    // because gl_ClipDistance is a desktop-GL feature LOVE does not expose
+    // and GLES has no equivalent at all; the cost is that a clipped triangle
+    // is still rasterised, which on the one extra pass this runs in is a
+    // fill-rate saving forgone rather than a correctness problem.
+    //
+    // The slack is a quarter of a world pixel: the surface's own quad is
+    // exactly AT the plane, and a shoreline tile that shares its height must
+    // not flicker in and out of its reflection on interpolation error. That
+    // is the same quarter-pixel Voxel3D.SHADOW_EPS already calls "float
+    // above the ground to dodge z-fighting" -- borrowed rather than
+    // re-tuned, because it is the same question.
+    //
+    // IN-GAME: the bridge over the water on Route 104, where the deck
+    // stands about eighteen pixels over a sheet whose own bank is level
+    // with it.
+    if (mirror.x > 0.5 && vAbove < -0.25) discard;
     vec4 p = Texel(tex, tc);
     // sprite sheets key GB OBJ color 0 to alpha 0; discarding rather than
     // blending keeps those texels out of the depth buffer, so a model never
@@ -276,32 +358,6 @@ local SHADER = [[
 -- Each entry is nil = untried, false = unavailable.
 local shaders = { [false] = nil, [true] = nil }
 local activeShader = nil      -- the variant this pass bound
-local backdropShader = nil
-
-local BACKDROP_BLUR = [[
-  uniform vec2 texel;
-  uniform float radius;
-  vec4 effect(vec4 color, Image image, vec2 uv, vec2 screen) {
-    vec2 d = texel * radius;
-    vec4 sum = Texel(image, uv) * 4.0;
-    sum += (Texel(image, uv + vec2(d.x, 0.0))
-         + Texel(image, uv - vec2(d.x, 0.0))) * 2.0;
-    sum += (Texel(image, uv + vec2(0.0, d.y))
-         + Texel(image, uv - vec2(0.0, d.y))) * 2.0;
-    sum += Texel(image, uv + d) + Texel(image, uv - d);
-    sum += Texel(image, uv + vec2(d.x, -d.y));
-    sum += Texel(image, uv + vec2(-d.x, d.y));
-    return color * (sum / 16.0);
-  }
-]]
-
-local function getBackdropShader()
-  if backdropShader == nil then
-    local ok, sh = pcall(love.graphics.newShader, BACKDROP_BLUR)
-    backdropShader = (ok and sh) or false
-  end
-  return backdropShader or nil
-end
 
 -- Scene canvases, one per NAMED SLOT. There are exactly two callers and
 -- they want different sizes -- the free-roam pass renders at the window's
@@ -364,7 +420,8 @@ end
 -- water pass reads (see beginWater); it is only ever made if something asks
 -- for one, so a session that never sees a lake never pays for it.
 local function releaseSlot(slotHeld)
-  for _, key in ipairs({ "canvas", "depth", "mirror" }) do
+  for _, key in ipairs({ "canvas", "depth", "mirror",
+                         "planar", "planarDepth" }) do
     local obj = slotHeld[key]
     if obj and obj.release then pcall(obj.release, obj) end
     slotHeld[key] = nil
@@ -966,6 +1023,11 @@ function Voxel3D.beginScene(w, h, cx, cy, vw, vh, sky, slot)
   -- start out flattening everything it drew.
   pcall(sh.send, sh, "ghost", 0)
   pcall(sh.send, sh, "ghostColor", Voxel3D.GHOST_COLOR)
+  -- and the world the right way up, reset per frame for the same reason
+  -- `ghost` is: a frame that opened in the middle of a planar pass -- a
+  -- driver hiccup between beginPlanar and endPlanar -- would otherwise draw
+  -- the entire scene reflected in a plane nobody asked about.
+  pcall(sh.send, sh, "mirror", { 0, 0 })
   -- the hour's light, as the caller last set it (see Voxel3D.tint)
   pcall(sh.send, sh, "dayTint", Voxel3D.tint or { 1, 1, 1 })
   -- the window glass: the tileset's mask (or the blank -- the sampler is
@@ -1078,36 +1140,6 @@ function Voxel3D.flatten(color, amount)
   end
 end
 
-function Voxel3D.coverRect(iw, ih, cw, ch, topOffset)
-  if not (iw and ih and cw and ch and iw > 0 and ih > 0
-          and cw > 0 and ch > 0) then return nil end
-  local scale = math.max(cw / iw, ch / ih)
-  local available = math.max(0, ih - ch / scale)
-  local crop = math.max(0, math.min(available, tonumber(topOffset) or 0))
-  return (cw - iw * scale) / 2, -crop * scale, scale
-end
-
-function Voxel3D.backdrop(image, topOffset)
-  if not (active and image and image.getDimensions) then return false end
-  local ok, iw, ih = pcall(image.getDimensions, image)
-  if not ok then return false end
-  local x, y, scale = Voxel3D.coverRect(
-    iw, ih, canvasW, canvasH, topOffset)
-  if not scale then return false end
-  local sh = getBackdropShader()
-  love.graphics.setShader(sh)
-  if sh then
-    pcall(sh.send, sh, "texel", { 1 / iw, 1 / ih })
-    pcall(sh.send, sh, "radius", 0.70)
-  end
-  love.graphics.setDepthMode()
-  love.graphics.setColor(1, 1, 1, 1)
-  love.graphics.draw(image, x, y, 0, scale, scale)
-  love.graphics.setDepthMode("lequal", true)
-  love.graphics.setShader(activeShader)
-  return true
-end
-
 -- ------------------------------------------------------- the water pass --
 --
 -- A reflective surface has to READ the frame it is being drawn into: the
@@ -1145,6 +1177,128 @@ end
 -- nil draws its water like ordinary terrain, which is what this mode always
 -- did.
 --
+-- ------------------------------------------------ the planar mirror pass --
+
+-- THE WORLD DRAWN A SECOND TIME, UPSIDE DOWN UNDER THE WATER.
+--
+-- WHY THIS EXISTS AT ALL, in one paragraph, because the mod already has a
+-- reflection and this is not a replacement for it. The screen-space march
+-- (see Water) can only reflect what is ON SCREEN, and worse than that: it
+-- stops at the FIRST crossing, and a rising reflected ray crosses the ground
+-- in front of a figure's feet before it ever reaches the pixels the figure
+-- covers. Measured headless against this mod's own camera, curve and lean
+-- over the bridge on Route 104, of ~100,000 water pixels marched a figure
+-- standing on the bridge deck reflects on 0 of them and one standing at the
+-- water's edge on 6 (both DERIVED, and the numbers Water's header already
+-- carries). A mirror that cannot hold a person standing beside it is the
+-- complaint this pass answers, and the only honest answer is to draw the
+-- world again with its Y flipped and let the rasteriser find them.
+--
+-- WHAT IS IN IT is the caller's business -- `paint` draws whatever should be
+-- reflected -- and VoxelScene states the list and why (drawPlanar).
+--
+-- THE PLANE. A planar reflection needs a PLANE, and this mode's water is a
+-- heightfield of one-pixel columns over a flat sheet, at whatever height the
+-- cell's own class recessed it to. There is therefore no single plane per
+-- MAP: measured over every water-bearing layout in Hoenn, Route 104 carries
+-- three surface heights and Route 120 five. There is very nearly one plane
+-- per VIEW, which is the only scope a frame needs -- measured over every
+-- camera window of the flat game's own 240x160 across the region, the
+-- dominant height covers 98.9% of the water on screen on Route 104, 93.3%
+-- in Lilycove and 85.8% on Route 120 (all DERIVED). So the caller names one
+-- height per frame, and the water shader accepts this texture only on the
+-- fragments whose own sheet stands at it -- everything else keeps the march
+-- and the sky it already had. Nothing is ever reflected at the WRONG height:
+-- what happens off-plane is that today's picture is what you get.
+--
+-- THE TARGET IS ITS OWN COLOUR AND DEPTH PAIR, not the frame's. The frame's
+-- depth already holds the real world and is about to be READ by the water's
+-- own test; a mirrored world written into it would occlude the lake it is
+-- supposed to be seen in. Allocated lazily, like the march's mirror canvas,
+-- so a session that never opens a reflective lake never pays for either.
+--
+-- Returns the texture, or nil when the pass cannot run -- no slot, no
+-- canvas, or a driver that will not make the pair. A caller that gets nil
+-- draws its water exactly as it did before this existed.
+--
+-- MUST be paired with endPlanar, which puts the frame back together.
+function Voxel3D.beginPlanar(planeY, paint)
+  if not (active and canvas and held and activeShader) then return nil end
+  if type(planeY) ~= "number" then return nil end
+  if not held.planar then
+    local ok, c = pcall(love.graphics.newCanvas, held.w, held.h)
+    if not (ok and c) then return nil end
+    pcall(c.setFilter, c, "nearest", "nearest")
+    -- CLAMP, and it matters: the water shader samples this by the water
+    -- fragment's own screen position nudged by the wave slope, which walks
+    -- a texel or two off the edge at the frame's rim. Wrapped, that reads
+    -- the opposite side of the reflection and stripes the far shore down
+    -- the near one.
+    pcall(c.setWrap, c, "clamp", "clamp")
+    held.planar = c
+  end
+  if not held.planarDepth then
+    held.planarDepth = newDepth(held.w, held.h)
+    if not held.planarDepth then
+      -- no depth means no occlusion in the mirror, which is not a softer
+      -- reflection but a wrong one -- the far bank painted over the near
+      -- one in mesh order. Refuse the pass instead.
+      return nil
+    end
+  end
+  if not pcall(love.graphics.setCanvas,
+               { held.planar, depthstencil = held.planarDepth }) then
+    pcall(love.graphics.setCanvas, depthTarget())
+    return nil
+  end
+  -- Colour AND depth, both this canvas's own: unlike beginWater, which
+  -- deliberately keeps the frame's depth so the march can test against it,
+  -- this pass is a whole scene of its own and starts from nothing.
+  -- Transparent black, so the water shader can tell "the mirror saw nothing
+  -- here" from "the mirror saw something black" by alpha alone -- the sky
+  -- over the far shore has to fall through to the painted sky, not to a
+  -- hole in the lake.
+  love.graphics.clear(0, 0, 0, 0, true, true)
+  love.graphics.setDepthMode("lequal", true)
+  love.graphics.setShader(activeShader)
+  love.graphics.setColor(1, 1, 1, 1)
+  pcall(activeShader.send, activeShader, "mirror", { 1, planeY })
+  Voxel3D.planarY = planeY
+  if paint then pcall(paint) end
+  -- ...and the world the right way up again BEFORE anything else draws.
+  -- Unconditionally and outside any success branch, for the reason endWater
+  -- states: a frame that bails halfway through has to be put back together
+  -- exactly like one that finished, or every pass after it draws mirrored.
+  pcall(activeShader.send, activeShader, "mirror", { 0, 0 })
+  -- ...and the frame's own target back under the brush. A driver that
+  -- refuses this leaves the pass with a texture nobody can safely draw
+  -- against, so the frame gets nil and falls back to the reflection it had
+  -- before this existed; endPlanar runs either way and tries again.
+  if not pcall(love.graphics.setCanvas, depthTarget()) then return nil end
+  pcall(love.graphics.setDepthMode, "lequal", true)
+  return held.planar
+end
+
+-- Put the frame back: the scene's own target, its depth test, its shader.
+-- Safe to call after a beginPlanar that returned nil.
+function Voxel3D.endPlanar()
+  if not active then return end
+  pcall(love.graphics.setCanvas, depthTarget())
+  pcall(love.graphics.setDepthMode, "lequal", true)
+  love.graphics.setColor(1, 1, 1, 1)
+  if activeShader then
+    pcall(activeShader.send, activeShader, "mirror", { 0, 0 })
+    love.graphics.setShader(activeShader)
+  end
+end
+
+-- Whether a planar pass can be opened in this frame at all: there is a live
+-- scene and a driver that made a readable depth canvas for it. Callers ask
+-- before they start moving canvases, the same way they ask depthReadable.
+function Voxel3D.planarReady()
+  return (active and held and held.depth) and true or false
+end
+
 -- MUST be paired with endWater, which puts the frame back together.
 function Voxel3D.beginWater(paint)
   if not (active and canvas and held and held.depth) then return nil end
@@ -1343,6 +1497,37 @@ function Voxel3D.endShadows()
   if not active then return end
   pcall(love.graphics.setDepthMode, "lequal", true)
   love.graphics.setColor(1, 1, 1, 1)
+end
+
+-- ----------------------------------------------------------- a ground decal
+--
+-- The depth mode beginShadows uses, WITHOUT its colour: depth-TESTED so the
+-- world still hides what is behind it, and never depth-WRITING.
+--
+-- The write half is the load-bearing half, and it is why this exists as its
+-- own pair rather than as a reuse of beginShadows.  A pass that writes no
+-- depth leaves the buffer exactly as it found it, so EVERY pass drawn after
+-- it meets the depth it would have met had this one never run -- and simply
+-- paints over the decal wherever it is opaque.  That is how a character card
+-- occludes a water ripple lying on the cell the character is standing in
+-- (VoxelScene.drawRipples): not by winning a depth test against the ring, but
+-- because the ring put nothing in the buffer to win against and the card is
+-- rasterised second.
+--
+-- beginShadows cannot be borrowed for it because it also sets the colour to
+-- translucent black, which is right for a drop shadow and turns a ripple
+-- sheet into a smudge.  The two share one line of implementation and nothing
+-- else; splitting them keeps the shadow pass's colour out of every future
+-- caller that just wants a decal.
+function Voxel3D.beginDecal()
+  if not active then return end
+  pcall(love.graphics.setDepthMode, "lequal", false)
+end
+
+-- Back to the ordinary test-and-write every other pass runs under.
+function Voxel3D.endDecal()
+  if not active then return end
+  pcall(love.graphics.setDepthMode, "lequal", true)
 end
 
 -- Draw one mesh with `model` (a Mat4) applied. Texture may be nil to keep

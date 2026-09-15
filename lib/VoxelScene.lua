@@ -35,8 +35,6 @@ local DayNight = V.require("DayNight")
 local FirstPerson = V.require("FirstPerson")
 local BattleBillboard = V.require("BattleBillboard")
 local Pokedex = V.require("Pokedex")
-local WorldUnderlay = V.require("WorldUnderlay")
-local WorldFillProps = V.require("WorldFillProps")
 local PaletteFX = require("src.render.PaletteFX")
 local Map = require("src.world.Map")
 
@@ -1145,13 +1143,26 @@ local GEN3_MOVEMENT_HIDDEN = 0x4C
 -- clears -- is inside the mound, and the depth test eats it.  Nothing is
 -- hidden, nothing is mis-framed, nothing is at zero scale: it is buried.
 --
--- WHY THE MOUND IS LEFT EXACTLY AS IT IS.  It is the SECOND defect here and
--- it is a GEOMETRY defect: a berry plot is flat tilled soil in the cartridge,
--- this mod's own behaviour table already says `[0xA0] = "ground"`, and the
--- cell only reads as a mass because its collision bit is set for the object
--- standing on it.  Correcting that moves shape state on 87 cells, and this
--- round is under a geometry freeze, so it is measured, recorded and refused
--- here rather than smuggled in beside a presentational fix.
+-- THE MOUND IS GONE AS OF g3-plot-298, AND THIS IS WHERE IT WENT.  The
+-- paragraph that used to stand here recorded the diagnosis and refused the
+-- fix -- "a berry plot is flat tilled soil in the cartridge, this mod's own
+-- behaviour table already says `[0xA0] = "ground"`, and the cell only reads
+-- as a mass because its collision bit is set for the object standing on it.
+-- Correcting that moves shape state on 87 cells, and this round is under a
+-- geometry freeze" -- and it was reported again from play, in the same words:
+-- "berrys trees are properly animated though but theyre sitting on large
+-- mounds of dirt when they shouldnt".
+--
+-- The correction is where the diagnosis said it was, in the SHAPE pass, and
+-- it is keyed on the byte and nothing else: `Gen3.isBerryPlot` (0xA0
+-- MB_BERRY_TREE_SOIL), three rules in `Gen3.classAt` and
+-- `Structures.capGen3Rock` that stop a plot being lathed, stood up or capped,
+-- and `Structures.levelGen3Plots`, which levels what is left with the ground
+-- beside it.  DERIVED, over all 88 of Hoenn's berry trees: the plot's drawn
+-- top was 4 to 20 pixels above the ground it is tilled into on 69 of them and
+-- flush on 19; it is now flush on all 88, no plot cell carries a stamp or a
+-- run, and the plant's feet sit exactly on the soil (0px, all 88 -- they were
+-- 16px under it on 3, 8px on 2, 2px on 1, and 4 to 32px above it on 69).
 
 -- THE TOP OF THE HULL STANDING ON A CELL, asked of the only thing that
 -- knows: the ROUND STAMP the mesher expands there.
@@ -1242,13 +1253,22 @@ end
 -- measured them, and one of them is never drawn at all.
 --
 -- A LIFT ONLY, NEVER A LOWERING.  Measured against the mesher's own emitted
--- geometry over all 88 of Hoenn's berry trees: 48 stand on a lathed hull and
--- every one of them rises by 14px (40 of them) or 15px (8) -- the hull's own
--- measured height, not a tuned constant, and the whole distribution is those
--- two adjacent values with nothing else in it.  The other 40 do not move:
--- 22 already stand on the top of what is drawn at their cell, and 18 stand on
--- a COLUMN whose top `drawnTop` declines to guess at.  Nothing anywhere is
+-- geometry over all 88 of Hoenn's berry trees: 48 stood on a lathed hull and
+-- every one of them rose by 14px (40 of them) or 15px (8) -- the hull's own
+-- measured height, not a tuned constant, and the whole distribution was those
+-- two adjacent values with nothing else in it.  The other 40 did not move:
+-- 22 already stood on the top of what was drawn at their cell, and 18 stood
+-- on a COLUMN whose top `drawnTop` declines to guess at.  Nothing anywhere is
 -- lowered, so no plant can be sunk into a bank by this.
+--
+-- AND SINCE g3-plot-298 IT IS INERT ON EVERY BERRY TREE IN HOENN, which is
+-- the outcome that was wanted.  A plot is no longer lathed, so no stamp is
+-- centred on one, so `drawnTop` answers nil and this returns `gh` unchanged
+-- -- DERIVED, all 88, 0 stamped tiles and 0 run tiles per plot cell.  It is
+-- kept rather than deleted because it is the RULE and not the workaround: it
+-- says a planted object stands on the drawing at its cell, and the moment a
+-- profile pins a plot to something with a hull that is still the right
+-- answer.  It costs one nil field read per berry tree per frame.
 --
 -- nil for every Gen 1, Gen 2 and Prism object, which carry no `berryTreeId`
 -- at all, and for a Gen 3 object standing on ordinary flat soil (`drawnTop`
@@ -1565,6 +1585,370 @@ local function drawCast(state, posed, atlasFor)
   Voxel3D.seams(true)
 end
 
+-- ---- THE RINGS A FOOT LEAVES ON THE WATER ---------------------------------
+--
+-- IN-GAME SITUATION: WALKING THROUGH THE SHALLOW WATER ON ROUTE 104 -- and,
+-- in the frame that motivated this, standing on the wooden bridge over it
+-- while two NPCs stand in the shallows off the side branch.  Every step that
+-- finishes on a rippling cell leaves a ring, the cartridge's animation
+-- outlives the step, so several are alive at once (OverworldState:spawnRipple
+-- / updateRipples own all of that -- nothing here changes WHEN a ring is
+-- made, only where and in what order it is drawn).
+--
+-- WHY IT IS GEOMETRY AND NOT AN OVERLAY.  These rings used to be composited
+-- by ctx.drawFx, the 2D seam the other seven field effects ride, which runs
+-- over the FINISHED scene -- terrain, water and every character card already
+-- down.  A ring therefore painted ON TOP of the player standing in it, and
+-- stood upright and unforeshortened besides.  Drawn here instead it is an
+-- ordinary quad in the world: it foreshortens with the ground because it IS
+-- lying on the ground, and it is occluded by whatever is drawn after it.
+--
+-- A FUTURE PLANAR REFLECTION PASS GETS THESE FOR FREE, and should.  The ring
+-- is now real geometry sitting at the water plane, so a pass that mirrors the
+-- scene about that plane finds it where the mirrored and the original copy
+-- coincide.  It is deliberately NOT painted into the CURRENT screen-space
+-- mirror (VoxelScene.drawWater's `cast` callback, which runs before this):
+-- that copy exists so upright sprites standing BESIDE the water have colour
+-- for the march to find, and a disc lying flat ON the mirror would be
+-- doubled onto itself rather than reflected.
+
+-- THE HEIGHT THE RING LIES AT, and why it is the flat surface rather than the
+-- wave crest.
+--
+-- The water surface this mode draws is a heightfield: one-world-pixel columns
+-- standing up to Water.WAVE_HEIGHT (5, STATED) above the plane.  But those
+-- columns are not geometry at all -- the mesh is still one flat quad per tile
+-- and the bars are found by the PIXEL SHADER walking the view ray down
+-- through the slab (Water.relief).  There is no crest for anything outside
+-- that shader to stand on: asking for "the height of the wave under this
+-- cell" would mean re-implementing the wave trains in Lua, evaluating them at
+-- one point of a 16px ring, and bobbing the whole ring 0..5px a frame off a
+-- number the shader is free to change.  The cartridge's ring does not bob.
+-- So the honest answer is the SURFACE PLANE -- the quad the relief is carved
+-- out of -- and the crests wash over the ring the same way they wash over
+-- everything else drawn inside the water's footprint.
+--
+-- That plane is the cell's own drawn top.  Every cell a ripple can spawn on
+-- is a `water` cell: the three rippling behaviours are 16, 20 and 22 (STATED,
+-- Game.data.constants.gen3Ripple.behaviours, off MetatileBehavior_HasRipples)
+-- and data/gen3_shapes.lua maps all three to class `water` (DERIVED, read out
+-- of the shipped table).  ChunkMesher draws a water cell's sheet at that
+-- class's own height -- -2 in the shipped data/voxel_heights.lua (STATED),
+-- the recess TileShape sinks water into -- while `groundAt` deliberately
+-- refuses to lower a walker for it ("a recessed class (water) still supports
+-- whatever stands on it").  So the sheet is groundAt + the class recess, and
+-- this asks the SAME TileShape lookup groundAt asks, at the same tx/ty, so
+-- the two can never disagree about which shape the cell has.
+--
+-- Falls back to groundAt untouched wherever the cell is not `water` or the
+-- profile does not recess it (recess >= 0) -- which is every Gen 1, Gen 2 and
+-- Prism map, none of which can reach this function at all: no cartridge but
+-- Gen 3 defines gen3Ripple, so `state.ripples` is never non-empty there.
+--
+-- KNOWN BOUND, stated rather than hidden: ChunkMesher's heightAt prefers a
+-- terrace run's own height to the shape's where a water cell sits inside one,
+-- and there the sheet is at run.h rather than run.h + recess.  This answers
+-- the recessed figure, so such a ring lies up to |recess| = 2 world pixels
+-- below its sheet.  Two pixels, under a surface whose own relief is five, on
+-- a decal that writes no depth: it cannot be occluded by the error.
+local function rippleSurfaceY(map, cellX, cellY)
+  local gh = groundAt(map, cellX, cellY)
+  if not (map and map.inBounds and map:inBounds(cellX, cellY)) then return gh end
+  local okShapes, shapes = pcall(TileShape.forMap, map)
+  if not (okShapes and type(shapes) == "table") then return gh end
+  -- the same bottom-left collision tile groundAt reads (Map:cellTile)
+  local tx, ty = cellX * 2, cellY * 2 + 1
+  local okAt, s = pcall(TileShape.at, map, shapes, Gen3.tileAt(map, tx, ty),
+                        tx, ty)
+  if not (okAt and type(s) == "table") then return gh end
+  if s.class ~= "water" then return gh end
+  local recess = tonumber(s.h)
+  if not recess or recess >= 0 then return gh end
+  return gh + recess
+end
+
+-- ONE RING'S QUAD, lying in the XZ plane.
+--
+-- Sized and cut from the SpriteRenderer the flat path blits with, rather than
+-- through SpriteBillboards: `tileW`/`tileH` and the row at `frame * tileH`
+-- are exactly the box SpriteRenderer:drawFixedFrame hands LOVE, so the two
+-- paths cannot come out showing different pictures whatever shape the ripple
+-- sheet turns out to be.  (SpriteBillboards would also answer correctly for
+-- the 16x16 sheet this is, but its walker branches -- big dolls, mirrored
+-- half-strips, a 32-wide sheet that states no frame box -- are decisions
+-- about CHARACTERS, and a field effect should not be routed through them.)
+--
+-- The half-pixel UV inset is the same 0.02 / 0.05 the character cards use, to
+-- keep a neighbouring sheet row out of the ring's edge texels.
+--
+-- Memoised per sprite (weak-keyed, so a dropped SpriteRenderer takes its
+-- meshes with it) and per frame: the cartridge's animation is a handful of
+-- rows, so this builds at most that many quads for the whole session.
+local rippleMeshes = setmetatable({}, { __mode = "k" })
+
+local function rippleMesh(sprite, frame)
+  local okTex, tex = pcall(sprite.resolveImage, sprite)
+  if not (okTex and tex and tex.getDimensions) then return nil end
+  local iw, ih = tex:getDimensions()
+  if not (iw and ih and iw > 0 and ih > 0) then return nil end
+  local tw = math.floor(tonumber(sprite.tileW) or 16)
+  local th = math.floor(tonumber(sprite.tileH) or 16)
+  if tw < 1 or th < 1 then return nil end
+  local per = rippleMeshes[sprite]
+  if per == nil then per = {}; rippleMeshes[sprite] = per end
+  local key = frame .. "@" .. iw .. "x" .. ih
+  local hit = per[key]
+  if hit == nil then
+    local fy = frame * th
+    if fy + th > ih then fy = 0 end       -- same clamp drawFixedFrame's quad has
+    local u0, u1 = 0.02 / iw, (math.min(tw, iw) - 0.02) / iw
+    local v0, v1 = (fy + 0.05) / ih, (fy + th - 0.05) / ih
+    -- built in the cards' own local space -- X right, Y up the sheet, Z zero
+    -- -- and tipped onto the ground by the model matrix below, so the sheet's
+    -- TOP ends up pointing north (away from the camera), which is how the
+    -- flat game has it on screen.  Full shade (1): a ring is drawn art, not a
+    -- lit face, exactly like a character card.
+    local verts = {
+      { 0, 0, 0, u0, v1, 1 }, { tw, 0, 0, u1, v1, 1 },
+      { tw, th, 0, u1, v0, 1 }, { 0, th, 0, u0, v0, 1 },
+    }
+    local idx = {}
+    Voxel3D.pushQuad(idx, 0)
+    hit = Voxel3D.newMesh(verts, idx) or false
+    per[key] = hit
+  end
+  if not hit then return nil end
+  return hit, tex, tw, th
+end
+
+-- EVERY LIVE RING, AS GROUND GEOMETRY.
+--
+-- Called from drawScene between the water pass and the character pass; see
+-- the call site for why that position is the fix.
+--
+-- Gen 3 only, without a cartridge test anywhere in here: `state.ripples` is
+-- filled by OverworldState:updateRipples, every function of which returns
+-- early unless Game.data.constants.gen3Ripple exists, and that constant is
+-- written by the Gen 3 importer alone.  On Gen 1, Gen 2 and Prism the list is
+-- nil and this returns on its first line.
+--
+-- Every engine call is guarded, because the ripple field effect is newer than
+-- some caches this mod can be run against: a data set whose sprite table
+-- predates SPRITE_G3_RIPPLE answers nil for the sheet and no rings are drawn,
+-- which is what happened before any of this existed.
+local function drawRipples(state)
+  local rings = state and state.ripples
+  if not (rings and #rings > 0) then return end
+  local map = state.map
+  if not map then return end
+  if type(state.rippleSprite) ~= "function" then return end
+  local okSprite, sprite = pcall(state.rippleSprite, state)
+  if not (okSprite and sprite) then return end
+  -- sprite sheets carry no wireframe and no glass, for the reasons drawCast
+  -- argues about the characters: the grid turns a 16px drawing into a mesh,
+  -- and the sheet's texcoords mean nothing to the tileset-shaped pane mask
+  Voxel3D.glass(false)
+  Voxel3D.seams(false)
+  Voxel3D.beginDecal()
+  for _, r in ipairs(rings) do
+    local frame = 0
+    if type(state.rippleFrame) == "function" then
+      local okFrame, f = pcall(state.rippleFrame, state, r.clock)
+      frame = (okFrame and tonumber(f)) or 0
+    end
+    local mesh, tex, tw, th = rippleMesh(sprite, frame)
+    if mesh and r.px and r.py then
+      -- the ring's own CENTRE picks the cell, not its top-left: spawnRipple
+      -- lifts the 16px ring so it closes AROUND the feet rather than sitting
+      -- under them, which leaves its top-left a few pixels north of the cell
+      -- boundary while its middle stays inside the cell that was stepped on
+      local cx = math.floor((r.px + tw * 0.5) / 16)
+      local cy = math.floor((r.py + th * 0.5) / 16)
+      -- SHADOW_EPS (0.25 world px, STATED): the mod's own already-calibrated
+      -- "float above the ground to dodge z-fighting", borrowed rather than
+      -- re-tuned.  It is needed because under the world curve drawWater runs
+      -- a depth-writing prepass of the water surface, so a ring drawn exactly
+      -- coplanar with the sheet fights it.  Lifting rather than pulling
+      -- camera-ward keeps the ring's depth honest against the BRIDGE DECK a
+      -- ring can reach under on Route 104 -- a quarter of a pixel cannot
+      -- climb the ~18px from the sheet to the planks.
+      local y = rippleSurfaceY(map, cx, cy) + Voxel3D.SHADOW_EPS
+      -- local (x, y, 0) -> (x, 0, -y) under rotateX(-pi/2), so translating to
+      -- the ring's SOUTH edge lands local y = 0 there and local y = th on its
+      -- north edge: the quad covers exactly [px, px+tw] x [py, py+th], the
+      -- same world rectangle SpriteRenderer:drawFixedFrame blits into
+      local model = Mat4.mul(Mat4.translate(r.px, y, r.py + th),
+                             Mat4.rotateX(-math.pi / 2))
+      Voxel3D.draw(mesh, tex, model)
+    end
+  end
+  Voxel3D.endDecal()
+  Voxel3D.seams(true)
+  Voxel3D.glass(true)
+end
+
+-- ------- the planar mirror's plane
+--
+-- WHICH HEIGHT THE MIRRORED SCENE IS RENDERED FOR.
+--
+-- A planar reflection needs a PLANE and this mode's water is not one. Every
+-- sheet lies at its own cell's drawn top -- the water class's recess over
+-- whatever terrace the cell sits on -- so a map carries as many surfaces as
+-- it has water at different elevations. MEASURED over every water-bearing
+-- layout in Hoenn, off the mesher's own water sink: Petalburg City has 1,
+-- Lilycove 3, Route 104 3 (61.3% at y=-2 and 38.3% at y=12, fourteen world
+-- pixels apart), Route 119 6 and Route 120 5 (DERIVED).
+--
+-- A FRAME, though, very nearly has one. MEASURED over every camera window of
+-- the flat game's own 240x160 across the region, the single most common
+-- water height on screen covers 98.9% of the visible water on Route 104 --
+-- the map this was reported from -- 93.3% in Lilycove, 92.3% on Route 119,
+-- 85.8% on Route 120 and 100% on Petalburg and Route 110 (all DERIVED). So
+-- the pass is rendered for the DOMINANT height in view, and the water shader
+-- accepts it only on the fragments whose own sheet stands there
+-- (Water.PLANE_TOL). The minority keeps the screen-space march and the sky
+-- it already had: not a wrong reflection, the one it has always shown.
+--
+-- READ THROUGH rippleSurfaceY, deliberately and not by re-deriving it. That
+-- function already answers "how high is the water sheet in this cell" for the
+-- ripple rings, off the same TileShape lookup groundAt asks, and its header
+-- argues at length why the SURFACE PLANE rather than the wave crest is the
+-- honest answer -- the crests are carved by the pixel shader and there is no
+-- geometry at one. Two functions answering that question two ways is two
+-- answers that can drift; this is the same sentence twice.
+--
+-- SAMPLED ON A STRIDE rather than per cell. The mode is a diorama: water
+-- comes in sheets, not in speckle, and the mode of a 4-cell lattice over the
+-- view is the mode of the view. At the flat game's 240x160 that is about 40
+-- lookups a frame against 150 cells, and it is memoised on the view rectangle
+-- besides, so a standing camera pays once.
+--
+-- Gen 1, Gen 2 and Prism reach this exactly as Gen 3 does and get the same
+-- answer from the same lookup: `isWaterCell` is the engine's, rippleSurfaceY
+-- falls back to groundAt untouched wherever the cell is not a recessed water
+-- class, and the row that calls any of this is OFF by default everywhere.
+local PLANE_STRIDE = 4
+local planeCache = setmetatable({}, { __mode = "k" })
+
+local function waterPlane(map, cx, cy, vw, vh)
+  if not (map and map.inBounds and vw and vh) then return nil end
+  -- the view rectangle in CELLS, generously: the diorama camera sees past
+  -- the flat game's own window, and a plane chosen off too small a sample is
+  -- the wrong plane the moment the camera pans
+  local halfW = math.floor((vw / 16) * 0.75) + 2
+  local halfH = math.floor((vh / 16) * 0.75) + 2
+  local ccx, ccy = math.floor(cx / 16), math.floor(cy / 16)
+  local key = ccx .. "," .. ccy .. "," .. halfW .. "," .. halfH
+  local hit = planeCache[map]
+  if hit and hit.key == key then return hit.y end
+  local counts, best, bestN = {}, nil, 0
+  for gy = ccy - halfH, ccy + halfH, PLANE_STRIDE do
+    for gx = ccx - halfW, ccx + halfW, PLANE_STRIDE do
+      local okW, isW = pcall(map.isWaterCell, map, gx, gy)
+      if okW and isW then
+        local y = rippleSurfaceY(map, gx, gy)
+        if y then
+          local n = (counts[y] or 0) + 1
+          counts[y] = n
+          -- ties go to the LOWER sheet, which is the open water rather than
+          -- a pond on a terrace above it: a tie means the two are equally
+          -- present and the lower one is the one a shoreline camera is
+          -- looking across. Deterministic either way, which matters more
+          -- than which way -- a plane that flickers between two heights
+          -- flickers the whole reflection with it.
+          if n > bestN or (n == bestN and best and y < best) then
+            best, bestN = y, n
+          end
+        end
+      end
+    end
+  end
+  planeCache[map] = { key = key, y = best }
+  return best
+end
+
+-- THE MIRRORED SCENE ITSELF.
+--
+-- WHAT GOES IN, and what does not. Everything here is drawn a SECOND time,
+-- so every entry is a draw call bought with a reason:
+--
+--   THE TERRAIN, and every neighbour's. The shoreline, the cliffs, the
+--   buildings and the bridge deck are the mass of what a lake reflects, and
+--   they are one mesh per map -- the cheapest thing in the frame per pixel
+--   of reflection it buys. MeshBounds still culls an off-screen neighbour
+--   inside Voxel3D.draw, and a mirrored neighbour is off screen exactly when
+--   the upright one is.
+--
+--   THE GRASS AND THE FLOWERS, one mesh each per map. A grassy bank that
+--   reflects as bare soil is the reflection saying the bank is not there.
+--
+--   THE CAST, through the SAME callback the screen-space mirror is given.
+--   This is the entire reason the pass exists (see Water.planarLevel), and
+--   routing it through one function is the same call drawCast already makes
+--   for itself: two copies of a draw are two copies that can diverge.
+--
+-- ...AND WHAT IS DELIBERATELY LEFT OUT:
+--
+--   THE RIPPLE RINGS. A ring lies flat IN the plane, so mirrored it lands on
+--   the screen pixels it already occupies -- and it is drawn there for real,
+--   after the water, by drawRipples. The reflection of it would be exactly
+--   underneath its own opaque draw and invisible. drawRipples' own header
+--   expects a planar pass to "get these for free"; measured against what the
+--   frame would show, free is also worthless here, and a draw call that
+--   cannot change a pixel is not one this pass should spend. (It is the same
+--   conclusion the screen-space mirror reached by a different route: a disc
+--   lying flat on a mirror is doubled onto itself.)
+--
+--   THE WATER ITSELF. There is nothing to reflect a mirror in, and the
+--   surface is exactly at the clip plane, where it would z-fight its own
+--   flipped copy.
+--
+--   THE PLAYER'S SILHOUETTE. It is a trick played on the camera -- "the
+--   world is in front of the player" -- and the mirror is not the camera.
+--
+-- Returns the mirror texture, or nil, in which case the water shader is sent
+-- `planarOn` 0 and draws the reflection it drew before this existed.
+local function drawPlanar(state, terrain, nbMesh, atlasFor, cast,
+                          cx, cy, vw, vh)
+  if not Water.reflectPlanar() then return nil, nil end
+  if not Voxel3D.planarReady() then return nil, nil end
+  local map = state and state.map
+  local planeY = map and waterPlane(map, cx, cy, vw, vh)
+  -- No water anywhere in view: nothing would sample the texture, so the
+  -- whole pass is skipped and the frame costs exactly what it always did.
+  -- This is also what makes the row free on a map with no lake in it.
+  if not planeY then return nil, nil end
+  local tP = Perf.now()
+  -- one counter per frame the pass actually runs, so a measured run can tell
+  -- "the row is on" from "the row is on and the frame is paying for it" --
+  -- the two are different on any map with no water in view (see above).
+  -- Dark unless DS_PERF is set, like everything else in Perf.
+  Perf.count("water.planar")
+  local tex = Voxel3D.beginPlanar(planeY, function()
+    Voxel3D.draw(terrain, atlasFor(state.map), nil)
+    for i, nb in ipairs(state.neighbors or {}) do
+      Voxel3D.draw(nbMesh[i], atlasFor(nb.map),
+                   Mat4.translate(nb.ox, 0, nb.oy))
+    end
+    -- the bank the water laps at. No camera-ward pull: the pull is a depth
+    -- bias aimed at the FRAME's own buffer, to settle grass against the feet
+    -- standing in it, and in here there are no feet to settle against -- the
+    -- mirror has its own depth buffer and the only question it asks is which
+    -- mirrored thing is in front of which.
+    Voxel3D.draw(ChunkMesher.grass(state.map), atlasFor(state.map), nil)
+    Voxel3D.draw(ChunkMesher.flowers(state.map), atlasFor(state.map), nil)
+    for _, nb in ipairs(state.neighbors or {}) do
+      local m = Mat4.translate(nb.ox, 0, nb.oy)
+      Voxel3D.draw(ChunkMesher.grass(nb.map), atlasFor(nb.map), m)
+      Voxel3D.draw(ChunkMesher.flowers(nb.map), atlasFor(nb.map), m)
+    end
+    if cast then cast() end
+  end)
+  Voxel3D.endPlanar()
+  Perf.add("VoxelScene.drawPlanar", tP)
+  return tex, planeY
+end
+
 -- ------- the water pass
 --
 -- Between the terrain and everything that stands on it, because water is a
@@ -1627,7 +2011,7 @@ end
 -- GPUs they don't reliably (that fight is what put the Android port back on
 -- flat water). Confined to the curve there is no regression to reach: the
 -- flat world never had the far-shore bug in the first place.
-function VoxelScene.drawWater(draws, cast)
+function VoxelScene.drawWater(draws, cast, planar, planarY)
   local tW = Perf.now()
   -- prepass only under the bend; see the header
   local curved = (Voxel3D.curveK or 0) > 0
@@ -1657,6 +2041,12 @@ function VoxelScene.drawWater(draws, cast)
       screen = { w, h }, cell = Voxel3D.cell, fov = Voxel3D.fovY,
       skyEdge = Voxel3D.skyEdge, grid = VoxelGrid.enabled(),
       lookFlat = Voxel3D.lookFlat, descent = Voxel3D.descent,
+      -- the mirrored scene, already rendered and already released from its
+      -- canvas (see drawPlanar). nil is the answer on every frame the row is
+      -- off, the tier capped it, there is no water in view, or the driver
+      -- would not make the pair -- and `planarOn` 0 is what the shader is
+      -- sent then.
+      planar = planar, planarY = planarY,
     })
     if ok then
       for _, d in ipairs(draws) do
@@ -2058,23 +2448,10 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
   -- about anything but their viewpoint.
   local function drawScene()
 
-  -- The world beyond the authored maps: a flat fill (CYAN/BLACK), nothing
-  -- (OFF/KFP hands the horizon to another mod), or NATURE's biome billboards.
-  -- Resolved before the terrain so a color fill covers everything drawn after.
-  local underlayColor = WorldUnderlay.resolve(state, modeColors(paletteFor, state.map))
-
   Voxel3D.draw(terrain, atlasFor(state.map), nil)
   for i, nb in ipairs(state.neighbors or {}) do
     Voxel3D.draw(nbMesh[i], atlasFor(nb.map),
                  Mat4.translate(nb.ox, 0, nb.oy))
-  end
-
-  -- Trees or rocks continue the authored route beyond its finite mesh. They
-  -- stand only on world cells outside the root/connected-map rectangles,
-  -- so no billboard can poke through valid terrain or block the player.
-  WorldFillProps.draw(state, cx, cy, vw, vh)
-  if underlayColor then
-    WorldUnderlay.draw(state, cx, cy, underlayColor)
   end
 
   -- Without a shadow map (headless, or a driver that could not make the
@@ -2171,16 +2548,46 @@ function VoxelScene.render(state, w, h, vw, vh, paletteFor, eyes)
                                       Mat4.translate(nb.ox, 0, nb.oy) }
     end
   end
-  -- the cast goes into the reflection copy only -- see drawWater for why it
-  -- cannot be composited yet and why it is drawn through the same function
-  -- the real pass below uses
   if #waterDraws > 0 then
-    VoxelScene.drawWater(waterDraws, function()
+    -- ONE `cast` CLOSURE FOR BOTH MIRRORS, built once here. The
+    -- screen-space copy needs it for colour and the planar pass needs it for
+    -- geometry, and they must be the same crowd in the same poses or the two
+    -- halves of one reflection disagree about who is standing there.
+    local castOnce = function()
       drawCast(state, posed, atlasFor)
       drawBattleCards()
-    end)
+    end
+    -- THE MIRRORED SCENE FIRST, because drawWater is about to take the
+    -- frame's own canvas apart -- beginWater detaches the depth texture so
+    -- the march can read it -- and a whole second scene cannot be rendered
+    -- through a target that is mid-surgery. Here the frame is still intact
+    -- and the planar pass owns its own colour/depth pair outright.
+    local planarTex, planarY = drawPlanar(state, terrain, nbMesh, atlasFor,
+                                          Water.reflectCast() and castOnce
+                                          or nil,
+                                          cx, cy, vw, vh)
+    -- the cast goes into the reflection copy only -- see drawWater for why
+    -- it cannot be composited yet and why it is drawn through the same
+    -- function the real pass below uses
+    VoxelScene.drawWater(waterDraws, Water.reflectCast() and castOnce or nil,
+                         planarTex, planarY)
   end
 
+  -- AND THE RIPPLE RINGS ON TOP OF IT, BEFORE ANYBODY IS STANDING IN IT.
+  --
+  -- THIS LINE'S POSITION IS THE WHOLE FIX.  Reported from play: "the ripples
+  -- are appearing over the player character make those masked by my character
+  -- sprite so they appear behind them".  They were, because they were drawn
+  -- by ctx.drawFx -- a 2D overlay over the finished scene -- and a finished
+  -- scene already has the player in it.  Here the ring is geometry, and it
+  -- goes down AFTER the water it lies on and BEFORE drawCast, so a card
+  -- rasterised later simply covers it.  The decal mode writes no depth
+  -- (Voxel3D.beginDecal), so the cards meet the exact depth buffer they met
+  -- before this pass existed and nothing about their own occlusion changes.
+  --
+  -- IN-GAME: THE SHALLOW WATER OFF THE BRIDGE ON ROUTE 104, where the two
+  -- NPCs stand in the water they are ringing.
+  drawRipples(state)
 
   -- Sprite sheets from here to the figure pass: their texture coordinates
   -- mean nothing to the tileset-shaped glass mask, so the glass is off or

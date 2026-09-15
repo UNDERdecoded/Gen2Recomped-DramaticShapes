@@ -5,8 +5,22 @@
 -- image, because the composite ran through whatever shader the scene had
 -- bound. Counting non-transparent pixels is the only check that would have
 -- caught it.
-package.path = "/tmp/work/?.lua;/tmp/work/?/init.lua;" .. package.path
-local MOD = "/tmp/modwork/DRAMATIC_SHAPE/"
+-- The engine tree this suite runs against.  Defaults to the current
+-- directory, so the suite runs from a repository checkout on any
+-- machine; override with ENGINE=... to point it somewhere else.  It
+-- used to name a scratch directory that exists only on one
+-- contributor's box, which meant this suite loaded src/* from THAT
+-- tree no matter what MOD said.
+local ENGINE = os.getenv("ENGINE") or "."
+package.path = ENGINE .. "/?.lua;" .. ENGINE .. "/?/init.lua;" .. package.path
+-- The mod under test.  Defaults to the tree this suite ships in, so the
+-- suite runs from a checkout on any machine; override with MOD=... to
+-- point it somewhere else.  It used to name a scratch directory that
+-- exists only on one contributor's box, so four of the six suites were
+-- silently measuring a stale copy -- and reported green while the tree
+-- they were meant to cover was failing.
+local MOD = os.getenv("MOD") or "mods/DRAMATIC_SHAPE"
+if MOD:sub(-1) ~= "/" then MOD = MOD .. "/" end
 
 _G.love = require("tests.love_stub")
 

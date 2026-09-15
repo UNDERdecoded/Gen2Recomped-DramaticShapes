@@ -43,23 +43,9 @@ local BattleArena = V.require("BattleArena")
 local BattleCam = V.require("BattleCam")
 local BattleScene = V.require("BattleScene")
 local BattleDOF = V.require("BattleDOF")
-local WorldCanvasOrientation = V.require("WorldCanvasOrientation")
 local BattleHud = V.require("BattleHud")
 local BattlePics = V.require("BattlePics")
-local BattlePresentation = V.require("BattlePresentation")
-local BattleArt = V.require("BattleArt")
-local BattleVisibility = V.require("BattleVisibility")
-local UiBackplates = V.require("UiBackplates")
-local AnimatedBattleArt = V.require("AnimatedBattleArt")
-local StadiumModels = V.require("StadiumModels")
 local Voxel3D = V.require("Voxel3D")
--- Event logger for the staged-battle path (engine log; plain print does not
--- reach it in fused builds). Module-level so every seam in this file can use
--- it, not just the ones below install().
-local TraceLog = pcall(require, "src.core.Logger") and require("src.core.Logger")
-local function trace(fmt, ...)
-  if TraceLog then TraceLog.warn("[BATTLE_ART_VOXEL_GEN2] " .. fmt, ...) end
-end
 local ChunkMesher = V.require("ChunkMesher")
 
 local OverworldBattle = {}
@@ -155,15 +141,6 @@ function OverworldBattle.pinnedPic(battle, img)
   if img == battle.playerBackPic then return true end
   local player = battle.player
   return (player and img == player.sprite) and true or false
-end
-
--- Whether this is a live front Pokemon picture rather than trainer or back
--- art. ROM fronts keep the decoder's keyed transparency; ROM backs retain the
--- paper reconstruction needed by their original white battle-field slot.
-function OverworldBattle.isFrontPokemonPic(battle, img)
-  if not (battle and img) then return false end
-  return ((battle.enemy and img == battle.enemy.sprite)
-          or (battle.player and img == battle.player.sprite)) and true or false
 end
 
 -- ------- both mons face you
@@ -704,6 +681,235 @@ function OverworldBattle.bands(geom, battle)
   }
 end
 
+-- ------- THE BOTTOM ROW SPANS THE WINDOW
+--
+-- IN-GAME: "fill the text and fight bag, run pokemon menue to left and right to
+-- fit the screen", and then, choosing between the two ways to answer it:
+-- "Widen, leave the text where it is -- three-slice the panels to full width
+-- but don't touch text layout; words stay at the left of a wider box."
+--
+-- The strip is the cartridge's own 240x48 picture, drawn whole by
+-- Gen3Battle's drawPanel, and it is inset with the letterbox while the world
+-- runs out to the window's edges. Widening it needs a repeatable middle, and
+-- the art HAS one -- measured off the bitmaps rather than assumed:
+--
+--     textbox_message  one panel   0..239  identical columns  11..228
+--     textbox_action   panel       0..119  identical columns  11..119
+--                      panel     121..238  identical columns 127..232
+--     textbox_moves    panel       1..158  identical columns   7..152
+--                      panel     161..238  identical columns 167..232
+--
+-- So this measures the same thing at run time rather than stating it: a cache
+-- whose panels are shaped differently gets ITS slices, and one whose panels
+-- have no repeatable middle gets no widening at all and keeps today's picture.
+-- The same rule measurePlatforms follows for the platforms, for the same
+-- reason.
+--
+-- Cached per path, because it is a per-pixel scan of a 240x48 image -- a third
+-- of what measurePlatforms already does once per battle.
+local stripCache = {}
+
+function OverworldBattle.stripSlices(path)
+  if type(path) ~= "string" then return nil end
+  local hit = stripCache[path]
+  if hit ~= nil then return hit or nil end
+  stripCache[path] = false
+  local okA, Assets = pcall(require, "src.render.Assets")
+  if not okA then return nil end
+  local okD, id = pcall(Assets.imageData, path)
+  if not (okD and id) then return nil end
+  local ok, panels = pcall(function()
+    local w, h = id:getDimensions()
+    if not (w and h and w > 1 and h > 0) then return nil end
+    -- a PANEL is a run of columns with ink in them; the cartridge separates
+    -- the message box from the menu with a column of nothing
+    local ink, same = {}, {}
+    for x = 0, w - 1 do
+      local any = false
+      for y = 0, h - 1 do
+        local _, _, _, a = id:getPixel(x, y)
+        if a > 0 then any = true; break end
+      end
+      ink[x] = any
+    end
+    for x = 0, w - 2 do
+      local eq = true
+      for y = 0, h - 1 do
+        local r1, g1, b1, a1 = id:getPixel(x, y)
+        local r2, g2, b2, a2 = id:getPixel(x + 1, y)
+        if r1 ~= r2 or g1 ~= g2 or b1 ~= b2 or a1 ~= a2 then eq = false; break end
+      end
+      same[x] = eq
+    end
+    local out, st = {}, nil
+    for x = 0, w - 1 do
+      if ink[x] then
+        if st == nil then st = x end
+      elseif st ~= nil then
+        out[#out + 1] = { st, x - 1 }; st = nil
+      end
+    end
+    if st ~= nil then out[#out + 1] = { st, w - 1 } end
+    -- ...and inside each panel, the longest run of columns each identical to
+    -- the next: that is the one the middle repeats
+    for _, p in ipairs(out) do
+      local best, bestAt, run = 0, nil, nil
+      for x = p[1], p[2] - 1 do
+        if same[x] then
+          run = run or x
+          local len = x + 1 - run + 1
+          if len > best then best, bestAt = len, run end
+        else
+          run = nil
+        end
+      end
+      -- a middle worth repeating, not a two-pixel coincidence
+      if best >= 8 then p[3], p[4] = bestAt, bestAt + best - 1 end
+    end
+    return out
+  end)
+  if not (ok and panels and #panels > 0) then return nil end
+  stripCache[path] = panels
+  return panels
+end
+
+-- ------- ...AND THE THREE-SLICE ITSELF
+--
+-- Into the WORLD image, because that is the only surface that reaches the
+-- window's edges: the battle's own canvas IS the letterbox (see BattleState
+-- :draw, "one window-resolution canvas ... with the UI canvas composited over
+-- it in the classic letterbox afterwards"). So the panel goes down there and
+-- the engine's own glyphs, which are never touched, land on top of it from the
+-- UI canvas exactly where they always did.
+--
+-- ONLY THE OUTER EDGES MOVE. The leftmost panel's left cap reaches x = 0 and
+-- the rightmost panel's right cap reaches the window's width; every boundary
+-- between panels -- including the one-column gap the action strip puts between
+-- its message half and its menu half -- stays where the letterbox put it. There
+-- is no cut anywhere in this.
+--
+-- The middle is ONE source column stretched. That is a repeat rather than a
+-- resample, and it is safe under either texture filter for the same reason it
+-- is honest: the columns either side of it are identical, so there is nothing
+-- for a linear filter to bleed in.
+function OverworldBattle.spanStrip(shot, img, path, y0)
+  local panels = OverworldBattle.stripSlices(path)
+  if not (panels and img and shot and shot.canvas) then return false end
+  local s = shot.scale
+  if not (s and s > 0) then return false end
+  local okD, iw, ih = pcall(img.getDimensions, img)
+  if not (okD and iw and ih and iw > 0 and ih > 0) then return false end
+  local g = love.graphics
+  local prevCanvas = g.getCanvas()
+  local prevBlend, prevAlpha = g.getBlendMode()
+  g.push("all")
+  local okAll, err = pcall(function()
+    g.origin()
+    g.setScissor()
+    g.setCanvas(shot.canvas)
+    g.setBlendMode("alpha")
+    g.setColor(1, 1, 1, 1)
+    local top = shot.ly + y0 * s
+    for i, p in ipairs(panels) do
+      local p0, p1, m0, m1 = p[1], p[2], p[3], p[4]
+      local x0 = shot.lx + p0 * s
+      local x1 = shot.lx + (p1 + 1) * s
+      if i == 1 and x0 > 0 then x0 = 0 end
+      if i == #panels and x1 < shot.pw then x1 = shot.pw end
+      if m0 then
+        local lw = (m0 - p0) * s
+        local rw = (p1 - m1) * s
+        local mid = (x1 - rw) - (x0 + lw)
+        if mid < 0 then mid = 0 end
+        if lw > 0 then
+          g.draw(img, g.newQuad(p0, 0, m0 - p0, ih, iw, ih), x0, top, 0, s, s)
+        end
+        if mid > 0 then
+          g.draw(img, g.newQuad(m0, 0, 1, ih, iw, ih), x0 + lw, top, 0, mid, s)
+        end
+        if rw > 0 then
+          g.draw(img, g.newQuad(m1 + 1, 0, p1 - m1, ih, iw, ih), x1 - rw, top,
+                 0, s, s)
+        end
+      else
+        -- no middle worth repeating: this panel is put back where it was
+        g.draw(img, g.newQuad(p0, 0, p1 - p0 + 1, ih, iw, ih),
+               shot.lx + p0 * s, top, 0, s, s)
+      end
+    end
+  end)
+  if prevCanvas then g.setCanvas(prevCanvas) else g.setCanvas() end
+  g.pop()
+  g.setBlendMode(prevBlend or "alpha", prevAlpha)
+  g.setColor(1, 1, 1, 1)
+  return okAll and true or false
+end
+
+-- ------- ...AND WHICH PANEL, READ OFF THE ENGINE RATHER THAN MIRRORED
+--
+-- Gen3Battle picks between message, action and moves in five places. Copying
+-- that mapping is the drift this notebook has been bitten by, so instead this
+-- stands in front of love.graphics.draw for the length of drawTextArea and
+-- catches whichever panel image actually goes down -- by IDENTITY, against the
+-- images Assets hands out for the dataset's own three paths -- drops it from
+-- the UI canvas, and redraws it wide in the world image afterwards.
+--
+-- A panel whose art has no repeatable middle is NOT dropped: it goes down the
+-- way it always did, so a cache this cannot widen keeps exactly today's strip.
+function OverworldBattle.withSpannedStrip(battle, fn)
+  local shot = battle and battle.dramaticShapeShot
+  local c = battle and battle.data and battle.data.constants
+  local rec = c and c.gen3BattleTextbox
+  local imgs = rec and rec.images
+  local y0 = rec and math.floor(tonumber(rec.y) or 112)
+  if not (shot and shot.canvas and type(imgs) == "table" and y0) then
+    return fn(battle)
+  end
+  local okA, Assets = pcall(require, "src.render.Assets")
+  if not okA then return fn(battle) end
+  -- warmed BEFORE the hook goes on, so the per-pixel scan never runs inside
+  -- somebody else's draw
+  local byImg, any = {}, false
+  for _, which in ipairs({ "message", "action", "moves" }) do
+    local p = imgs[which]
+    if type(p) == "string" and OverworldBattle.stripSlices(p) then
+      local okI, im = pcall(Assets.image, p)
+      if okI and im then byImg[im] = p; any = true end
+    end
+  end
+  if not any then return fn(battle) end
+  local g = love.graphics
+  local realDraw = g.draw
+  local caught = {}
+  g.draw = function(drawable, ...)
+    local path = byImg[drawable]
+    -- the bare blit drawPanel makes: draw(img, 0, record.y). Anything else
+    -- wearing the same image is left alone rather than half-understood.
+    if path and select("#", ...) == 2 then
+      local x, y = ...
+      if x == 0 and y == y0 then
+        caught[#caught + 1] = { drawable, path }
+        return
+      end
+    end
+    return realDraw(drawable, ...)
+  end
+  local ok, err = pcall(fn, battle)
+  g.draw = realDraw
+  for _, row in ipairs(caught) do
+    local okS = pcall(OverworldBattle.spanStrip, shot, row[1], row[2], y0)
+    -- a strip that could not be laid wide is better laid narrow than not at
+    -- all: put the engine's own blit back where it would have gone
+    if not okS then
+      pcall(function()
+        love.graphics.setColor(1, 1, 1, 1)
+        realDraw(row[1], 0, y0)
+      end)
+    end
+  end
+  if not ok then error(err, 0) end
+end
+
 -- ------- AND IN A DOUBLE, EACH SIDE'S BOXES GO OUT TO ITS OWN WINDOW EDGE
 --
 -- IN-GAME: "move the pokemon hud boxes to the edges of the screen".
@@ -995,19 +1201,6 @@ function OverworldBattle.begin(state, battle)
   local ok, arena = pcall(BattleArena.find, state.map,
                           state.player.cellX, state.player.cellY,
                           state.player.surfing)
-  -- TEMP DIAGNOSTIC: trace why a fight does not stage. Remove once resolved.
-  -- (Logger writes to the engine log; plain print does not in fused builds.)
-  pcall(function()
-    local L = require("src.core.Logger")
-    L.info("[BATTLE_ART_VOXEL_GEN2] begin: enabled=%s map=%s cell=%s,%s surf=%s",
-      tostring(OverworldBattle.enabled()),
-      tostring(state.map and state.map.id),
-      tostring(state.player.cellX), tostring(state.player.cellY),
-      tostring(state.player.surfing))
-    L.info("[BATTLE_ART_VOXEL_GEN2] begin: arenaOk=%s arena=%s voxel3d=%s",
-      tostring(ok), tostring(arena ~= nil),
-      tostring(Voxel3D.available()))
-  end)
   if not (ok and arena) then return false end
 
   -- the fight is staged from here on, so the layout it is composed for is not
@@ -1057,18 +1250,6 @@ end
 function OverworldBattle.finish()
   if not session then return end
   restoreCast()
-  pcall(AnimatedBattleArt.finish, session.battle)
-  StadiumModels.release()
-  if session.battle then
-    local audit = session.animAudit
-    if audit then
-      trace("animated enemy ownership: misses=%d managed_frames=%d",
-        audit.misses, audit.frames)
-    end
-    trace("battle finished (staged frames suppressed: %s)",
-      tostring(OverworldBattle._suppressTrace and OverworldBattle._suppressTrace.n or 0))
-    OverworldBattle._suppressTrace = nil
-  end
   session = nil
   Voxel3D.camera = nil
 end
@@ -1100,11 +1281,6 @@ function OverworldBattle.update(dt)
     OverworldBattle.finish()
     return
   end
-
-  -- ANIMATED mode: advance atlas playback for both battlers and the player
-  -- trainer intro before this frame's textures are captured. Other modes
-  -- release any managed frames and fall back to STATIC/ROM ownership.
-  pcall(AnimatedBattleArt.update, session.battle, dt)
 
   -- Whether the shot is the player's to steer at all. BACK SPRITES pins
   -- their own mon to the GB's slot on the menu while the foe stands out on
@@ -1147,26 +1323,20 @@ function OverworldBattle.update(dt)
   -- inside somebody else's frame means putting the frame back afterwards.
   local okTex, textures = pcall(OverworldBattle.textures, session.battle)
   if not okTex then textures = nil end
-  local owned = AnimatedBattleArt.ownsFrame(
-    session.battle and session.battle.enemy)
-  if owned ~= nil then
-    local audit = session.animAudit
-    if not audit then
-      audit = { frames = 0, misses = 0 }
-      session.animAudit = audit
-    end
-    audit.frames = audit.frames + 1
-    if not owned then audit.misses = audit.misses + 1 end
-  end
   -- stashed for the VR eye pass, which stands these same pics on the map
   -- in ITS view of the world (VoxelScene's eyes path). Stashed HERE
   -- because rendering them binds canvases, which the eye pass -- mid-scene
   -- when it wants them -- must never do; reading a stashed canvas is free.
   session.textures = textures
-  -- The move-animation layer is rendered before the arena so it can stand on
-  -- the world plane with the mons. The HUD composite runs after that scene.
+  -- and the move-animation layer, for the same eyes -- rendered only
+  -- while a headset is actually watching, because only the VR world
+  -- pass draws it (the flat screen has the animations in-frame already)
   session.animTex = nil
-  if session.battle then
+  local okVR, vrOn = pcall(function()
+    local vr = V.require("VR")
+    return vr.active and vr.active() or false
+  end)
+  if okVR and vrOn and session.battle then
     local okA, anim = pcall(OverworldBattle.animTexture, session.battle)
     if okA then session.animTex = anim end
   end
@@ -1181,8 +1351,7 @@ function OverworldBattle.update(dt)
     (textures and textures.flash) and "F" or "-",
   }, "|")
   local ok, shot = pcall(BattleScene.render, session.state, session.arena,
-                         textures, session.token, session.battle,
-                         session.animTex, OverworldBattle.ANCHOR)
+                         textures, session.token)
   if not ok then
     -- One failure retires the arena for THIS battle and nothing else: the
     -- battle screen carries on as the engine's own, the free-roam pipeline
@@ -1231,13 +1400,6 @@ function OverworldBattle.update(dt)
     end
   end
   session.shot = shot
-  -- First composed shot of the fight: the moment the world override takes
-  -- over from the white/staging hold. One line per battle.
-  if shot and shot.canvas and not session.firstShotLogged then
-    session.firstShotLogged = true
-    trace("first shot ready (token %s) -- billboards take over",
-      tostring(session.token))
-  end
 end
 
 -- The finished shot for this frame, or nil when there is none and the battle
@@ -1292,7 +1454,6 @@ local innerAnim = nil
 
 function OverworldBattle.animTexture(battle)
   if not (innerAnim and battle) then return nil end
-  if not BattleVisibility.animationLayerVisible(battle) then return nil end
   if not (love.graphics and love.graphics.newCanvas) then return nil end
   if not animLayer then
     -- THE OAM AUTHORING SPACE, AND IT STAYS THERE.
@@ -1539,7 +1700,6 @@ local placed, placeLog = {}, {}
 -- bookkeeping, filled by the stamp hook in sideTexture.
 local drawnAt = {}
 local innerPics = nil                   -- captured by install()
-local stagedPics = nil                  -- our class wrapper, immune to instance overrides
 local innerHUDs = nil                   -- likewise, for the snapped HUD layer
 -- (innerAnim, their sibling, is declared up beside animTexture, which
 -- sits earlier in the chunk than this group and must see the local)
@@ -1590,7 +1750,19 @@ end
 -- Whether this side has anything to draw at all. Mirrors drawPicsLayer's own
 -- guards, so an empty canvas is never hung on a quad: a fainted, hidden or
 -- not-yet-sent-out mon simply has no billboard this frame.
-OverworldBattle.sideVisible = BattleVisibility.sideVisible
+local function sideVisible(battle, side)
+  if side == "enemy" then
+    if battle.showEnemyTrainer and battle.trainerPic then return true end
+    return (battle.enemy and battle.enemy.sprite and not battle.enemyHidden
+            and not battle.enemySendingOut
+            and not battle:fxHidden(battle.enemy)) and true or false
+  end
+  if battle.showPlayerBack and battle.playerBackPic then return true end
+  local hide = battle.safari or battle.demo
+  return (battle.player and battle.player.sprite and not hide
+          and not battle.sendingOut
+          and not battle:fxHidden(battle.player)) and true or false
+end
 
 -- Published, because the draw side needs the same answer: see
 -- OverworldBattle.flatFallback, which asks "would the engine have drawn a pic
@@ -1651,17 +1823,7 @@ local OFF = {
 -- feet ended up, in canvas coordinates.
 function OverworldBattle.sideTexture(battle, side)
   if not (innerPics and battle) then return nil end
-  -- Battle Art installs its selected species/trainer/player art onto the
-  -- battlers before the engine's own pics layer is captured, so the billboard
-  -- wears the replacement exactly as the flat battle would draw it. MODDED
-  -- (DUPLICATE FIX) makes apply() a no-op for species and leaves the
-  -- underlying sprite provider's answer in place.
-  pcall(BattleArt.apply, battle)
-  if not OverworldBattle.sideVisible(battle, side) then return nil end
-  -- apply() can release a stale static replacement back to the engine's ROM
-  -- sprite after AnimatedBattleArt.update() already chose this frame. Reclaim
-  -- the managed image at the consumer boundary, without ticking playback.
-  pcall(AnimatedBattleArt.reassert, battle[side])
+  if not sideVisible(battle, side) then return nil end
   local canvas = texCanvasFor(side)
   if not canvas then return nil end
 
@@ -1937,6 +2099,7 @@ function OverworldBattle.sideTexture(battle, side)
   elseif side == "player" and battle.showPlayerBack and battle.playerBackPic then
     trainer = true
   end
+
   -- ------- THE FOE'S ANCHOR IS ITS BASELINE, NOT ITS BUFFER'S BOTTOM EDGE
   --
   -- ONLY THE FRONT PIC, because only the front pic is missing a correction the
@@ -2057,9 +2220,6 @@ function OverworldBattle.sideTexture(battle, side)
                      or "NOT THROUGH THE PLACEMENT HELPERS",
                    tostring(ax), tostring(ay), tostring(trainer))
   end
-  -- FLIP FRONT SPRITE: DEFAULT marks an external player front that is already
-  -- authored facing the foe, so BattleScene must not mirror it a second time.
-  out.noMirror = side == "player" and not BattleArt.mirrorsPlayerSprite()
   return out
 end
 
@@ -2186,25 +2346,20 @@ function OverworldBattle.install()
     return math.max(1, math.floor((tonumber(base) or 1) + 0.5))
   end
 
-  -- ROM backs retain their keyed-white paper reconstruction. ROM fronts do
-  -- not: an enclosed transparent void and a painted shade-0 pixel are already
-  -- indistinguishable after decoding, and front art favors a clean silhouette.
+  -- Keyed-out whites inside a pic used to be filled by the white field
+  -- behind it. There is a world back there now, so they are filled here
+  -- instead -- see BattlePics, which puts the paper back without touching
+  -- the silhouette.
   --
-  -- Authored PNGs already distinguish painted white from transparent void;
-  -- only decoded ROM art needs its keyed shade-0 paper reconstructed.
+  -- The pinned pic is told that its feet are on the box, which is what lets
+  -- the pale-bodied back sprites be filled at all: their bellies leak out
+  -- through an opening too wide to read as a drain, and only the box under
+  -- them settles that it is not a hole. Passed the pre-bake image, because
+  -- that is the one the battle holds a reference to.
   local innerPic = BattleState.picImage
   function BattleState:picImage(img)
     local out = innerPic(self, img)
     if not OverworldBattle.shot() then return out end
-    local shinyPic = (self.enemy and img == self.enemy.sprite
-                      and BattleArt.isShiny(self.enemy))
-                  or (self.player and img == self.player.sprite
-                      and BattleArt.isShiny(self.player))
-    if BattleArt.isExternal(img) or BattleArt.isExternal(out)
-       or shinyPic then
-      return out
-    end
-    if OverworldBattle.isFrontPokemonPic(self, img) then return out end
     return BattlePics.filled(out, OverworldBattle.pinnedPic(self, img))
   end
 
@@ -2236,29 +2391,9 @@ function OverworldBattle.install()
     local shot = OverworldBattle.shot()
     -- AskName blanks the field on purpose (the nickname prompt is meant to
     -- sit on nothing); leave that one alone.
-    if self.blankForAskName then
+    if not shot or self.blankForAskName then
       -- nil, not false: the class default is inherited again, so a battle
       -- that loses its arena mid-fight goes back to white voids
-      self.letterboxWhite = nil
-      self.dramaticShapeShot = nil
-      return innerDraw(self)
-    end
-    if not shot then
-      -- A staged battle whose first shot is still rendering (the transition
-      -- wipe frames). Falling through to the flat battle here flashes the ROM
-      -- sprites and the white field through the wipe's holes on top of the
-      -- voxel world behind them -- the "flickering duplicate" on battle
-      -- start. Hold a plain white frame instead: the wipe is about to
-      -- reveal the composed world, and a battle that never stages (no
-      -- arena) takes the flat path again as soon as session clears.
-      if session and not session.broken then
-        self.letterboxWhite = true
-        self.dramaticShapeShot = nil
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.rectangle("fill", 0, 0, BattleScene.GB_W,
-                                BattleScene.GB_H)
-        return
-      end
       self.letterboxWhite = nil
       self.dramaticShapeShot = nil
       return innerDraw(self)
@@ -2271,8 +2406,7 @@ function OverworldBattle.install()
     -- as crisp as the free-roam diorama while the pics and text stay GB art.
     local renderer = game().renderer
     if renderer and renderer.setWorldOverride then
-      renderer:setWorldOverride(
-        WorldCanvasOrientation.present(shot.canvas, "battle"))
+      renderer:setWorldOverride(shot.canvas)
     end
     -- beginFrame clears the UI canvas white for an opaque state; the world is
     -- under it now, so clear it back to nothing and let it through. Safe to
@@ -2283,13 +2417,7 @@ function OverworldBattle.install()
     -- canvas; there is a world out to the window edges now
     self.letterboxWhite = false
     OverworldBattle.drawHudPanels(self)
-    -- A per-state decorator can shadow the class method and revive flat ROM
-    -- pics. Pin this draw to the staged wrapper, then restore its exact seam.
-    local instancePics = rawget(self, "drawPicsLayer")
-    self.drawPicsLayer = stagedPics
-    local ok, err = pcall(withoutBackgroundFill, self, innerDraw)
-    self.drawPicsLayer = instancePics
-    if not ok then error(err, 0) end
+    withoutBackgroundFill(self, innerDraw)
   end
 
   -- The mons are geometry standing on the map now, drawn in the 3D pass
@@ -2305,32 +2433,9 @@ function OverworldBattle.install()
   function BattleState:drawPicsLayer(slide, sx, sy, onlySide, skipMenuClip)
     local shot = self.dramaticShapeShot
     if not shot then
-      if session and OverworldBattle.enabled() then
-        -- staged but no shot yet: suppressed. Log only transitions into
-        -- this state and every Nth frame, so an intro's worth of frames is
-        -- visible without flooding. The flat pics draw NOTHING here: the
-        -- mons belong to the 3D world, and letting the engine's ROM sprites
-        -- slide in during these frames glitched against our billboard once
-        -- the shot arrived (most visibly with animated atlases).
-        local t = OverworldBattle._suppressTrace
-        if not t then t = { n = 0 }; OverworldBattle._suppressTrace = t end
-        t.n = t.n + 1
-        if t.n == 1 or t.n % 20 == 0 then
-          trace("pics SUPPRESSED (staging) frame=%d slide=%s side=%s backPinned=%s",
-            t.n, tostring(slide), tostring(onlySide),
-            tostring(OverworldBattle.backPinned()))
-        end
-        return
-      end
       return innerPics(self, slide, sx, sy, onlySide, skipMenuClip)
     end
     if OverworldBattle.backPinned() and onlySide ~= "enemy" then
-      -- Another sprite mod (HGSS_SPRITES et al) re-asserts its own frame on
-      -- the battler inside BattleState:update, every frame. Whatever it set
-      -- last would flicker against the image we staged in sideTexture. We
-      -- own this picture (DUPLICATE FIX: BATTLE ART), so re-install ours at
-      -- draw time; apply() is a no-op under MODDED.
-      pcall(BattleArt.apply, self)
       -- under the hour's own light, like everything else in the frame -- see
       -- withTint, and the tint BattleScene hands over with the shot.
       --
@@ -2453,7 +2558,7 @@ function OverworldBattle.install()
     end
     return drew
   end
-  stagedPics = BattleState.drawPicsLayer
+
   -- The battle's text box and its menus, over the frosted glass laid down for
   -- them rather than over their own white paper -- and their ink flipped with
   -- the HUD's when the ground under the frame is dark, by the same rule and
@@ -2461,23 +2566,18 @@ function OverworldBattle.install()
   local innerText = BattleState.drawTextArea
   function BattleState:drawTextArea()
     if not self.dramaticShapeShot then return innerText(self) end
-    if BattlePresentation.suppressed("text", self) then return end
     if isIOS() then return innerText(self) end
-    local mode = UiBackplates.textboxMode()
-    if mode == "WHITE" then return innerText(self) end
     local battle = self
     -- a layout whose message strip is the cartridge's own window frame keeps
-    -- it: there is no white slab to take away and no black ink to whiten
-    if OverworldBattle.opaqueWindows(battle) then return innerText(self) end
-    local style = UiBackplates.textboxFillStyle()
-    if style then
-      local g = love.graphics
-      local old = { g.getColor() }
-      g.setColor(style[1], style[2], style[3], style[4])
-      for _, rect in pairs(OverworldBattle.textRects(self)) do
-        g.rectangle("fill", rect[1], rect[2], rect[3], rect[4])
-      end
-      g.setColor(old[1], old[2], old[3], old[4])
+    -- it: there is no white slab to take away and no black ink to whiten --
+    -- and it is the one whose strip is laid out to the window's own edges
+    -- instead of the letterbox's (see OverworldBattle.withSpannedStrip). That
+    -- gate is the Gen 3 layout's own `opaqueWindows`, the same one PANEL_ALPHA
+    -- answers to, so the Game Boy layouts take the branch below and their strip
+    -- is untouched -- as is this one on a cache whose panel art cannot be
+    -- sliced, which withSpannedStrip hands straight back.
+    if OverworldBattle.opaqueWindows(battle) then
+      return OverworldBattle.withSpannedStrip(battle, innerText)
     end
     if not self.dramaticShapeDark then return withoutBoxFill(battle, innerText) end
     local fw, fh = BattleScene.surface()
@@ -2495,8 +2595,6 @@ function OverworldBattle.install()
   function BattleState:drawAnimLayer(colorized)
     local shot = self.dramaticShapeShot
     if not shot then return innerAnim(self, colorized) end
-    if not BattleVisibility.animationLayerVisible(self) then return end
-    if shot.animInWorld then return end
     -- Move animations are authored against the pics' old fixed slots, and one
     -- animation reaches across both sides, so there is no per-side offset to
     -- give them. They ride to where the PAIR went: the midpoint of the two
@@ -2589,8 +2687,6 @@ function OverworldBattle.install()
   -- only an exactly-black set is remapped.
   innerHUDs = BattleState.drawHUDs
   function BattleState:drawHUDs(slide)
-    if self.dramaticShapeShot
-       and BattlePresentation.suppressed("hud", self) then return end
     -- Normally the HUDs have already been drawn this frame, snapped out to the
     -- window's edges and composited into the world image (snapHUDs). Drawing
     -- them here as well would show each block twice, once in each place.
@@ -2729,9 +2825,11 @@ end
 -- in-frame draw must be skipped; false leaves the battle screen's own HUD
 -- exactly as it was before any of this existed.
 --
--- Both bands are blitted whether or not that side's HUD is live: they also
-  -- carry intro balls and the safari count. HUD glyphs draw directly over the
-  -- world; text boxes retain frosted glass unless their fill is OFF.
+-- Both bands are blitted whether or not that side's HUD is LIVE, because a band
+-- carries more than the HUD: the pokeball rows of the intro and of an enemy
+-- faint, and the safari ball count, all draw in these rows and belong at the
+-- same edge as the block they share it with. The panels are the ones that
+-- follow hudLive -- frosted glass under nothing is a slab floating in the arena.
 function OverworldBattle.snapHUDs(battle, shot)
   if not (battle and shot and shot.canvas and (shot.scale or 0) > 0) then
     return false
@@ -2748,17 +2846,14 @@ function OverworldBattle.snapHUDs(battle, shot)
   local opaque = geom.opaqueWindows and true or false
   local rects, bandX = OverworldBattle.snapRects(shot, battle)
   local enemy, player = OverworldBattle.hudLive(battle, slide)
-  local readable, panels = {}, {}
-  if enemy then readable.enemy = rects.enemy end
-  if player then readable.player = rects.player end
-  -- and the text box's optional glass, on the same pass. It stays in the middle
-  -- of the frame where the engine draws it -- only the HUDs were snapped out --
+  local live = {}
+  if enemy then live.enemy = rects.enemy end
+  if player then live.player = rects.player end
+  -- and the text box's own glass, on the same pass. It stays in the middle of
+  -- the frame where the engine draws it -- only the HUDs were snapped out --
   -- so its GB rect is mapped into the letterbox rather than to an edge.
-  local frostText = UiBackplates.textboxUsesFrost()
   for key, rect in pairs(OverworldBattle.textRects(battle)) do
-    local worldRect = toWorld(rect, shot)
-    readable[key] = worldRect
-    if frostText then panels[key] = worldRect end
+    live[key] = toWorld(rect, shot)
   end
   -- measured under the SNAPPED rects: the panels are over whatever the world
   -- shows at the window's edges now, which is not what was behind them in the
@@ -2769,9 +2864,7 @@ function OverworldBattle.snapHUDs(battle, shot)
   -- nothing behind the glyphs to measure and nothing for a flip to fix: the
   -- panel IS a cream sprite and white-on-cream is not contrast, it is the
   -- text gone. Measured and flipped only where the window is transparent.
-  if enemy then panels.enemy = rects.enemy end
-  if player then panels.player = rects.player end
-  local dark = (not opaque) and not UiBackplates.hudUsesColor() or false
+  local dark = (not opaque) and BattleHud.verdict(live, shot, true) or false
   -- the box's own ink is flipped where the engine draws it, in the GB frame,
   -- so the answer has to outlive this function (see drawHudPanels)
   if session then session.dark = dark end
@@ -2786,7 +2879,7 @@ function OverworldBattle.snapHUDs(battle, shot)
     g.setCanvas(shot.canvas)
     g.setBlendMode("alpha")
     if not opaque then
-      for _, rect in pairs(panels) do BattleHud.panel(rect, shot, dark, true) end
+      for _, rect in pairs(live) do BattleHud.panel(rect, shot, dark, true) end
     end
     -- the panels let the arena through on a layout whose windows are its own
     -- opaque sprites; see OverworldBattle.PANEL_ALPHA for the measurement
@@ -2827,7 +2920,8 @@ function OverworldBattle.snapHUDs(battle, shot)
   return true
 end
 
--- Lay frosted glass under text boxes and record which way all UI ink flips.
+-- Lay the frosted glass down under whichever HUD and box are about to draw,
+-- and record which way the glyphs have to flip.
 --
 -- The panels are the fallback path only: normally the HUDs are snapped out to
 -- the window's edges and their glass, and the box's, went into the world image
@@ -2865,20 +2959,14 @@ function OverworldBattle.drawHudPanels(battle)
   local slide = (battle.introSlide or 0) * 4
   local enemy, player = OverworldBattle.hudLive(battle, slide)
   local rect = OverworldBattle.geometry(battle).hudRect
-  local readable, panels = {}, {}
-  if enemy then readable.enemy = rect.enemy end
-  if player then readable.player = rect.player end
-  if enemy then panels.enemy = rect.enemy end
-  if player then panels.player = rect.player end
-  local frostText = UiBackplates.textboxUsesFrost()
-  for key, r in pairs(OverworldBattle.textRects(battle)) do
-    readable[key] = r
-    if frostText then panels[key] = r end
-  end
-  if not next(readable) then return end
-  local dark = not UiBackplates.hudUsesColor()
+  local live = {}
+  if enemy then live.enemy = rect.enemy end
+  if player then live.player = rect.player end
+  for key, r in pairs(OverworldBattle.textRects(battle)) do live[key] = r end
+  if not next(live) then return end
+  local dark = BattleHud.verdict(live, shot)
   battle.dramaticShapeDark = dark
-  for _, r in pairs(panels) do BattleHud.panel(r, shot, dark) end
+  for _, r in pairs(live) do BattleHud.panel(r, shot, dark) end
 end
 
 return OverworldBattle

@@ -219,7 +219,8 @@ function CamControl.install()
   -- Q and E, on the pad: the left stick's click pulls the camera out and the
   -- right stick's pulls it in. A controller has no wheel and no number row,
   -- and the two clicks are the only buttons a Gen 1 pad layout leaves free
-  -- (SELECT already walks the angle ladder).
+  -- (B+SELECT already walks the angle ladder; SELECT on its own belongs
+  -- to the registered key item).
   --
   -- Claimed for the two cameras a pad player can actually be looking at
   -- while pressing them -- the third-person boom and a staged battle's lens

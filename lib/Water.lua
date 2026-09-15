@@ -65,6 +65,26 @@
 --                depth in the mirror -- punches them out of the water they
 --                are standing beside (see beginWater).
 --
+--                AND THE CONDITION IS NARROWER THAN "SOMETHING BEHIND IT",
+--                which is worth stating plainly because the paragraph above
+--                reads as though it were not. The march stops at the FIRST
+--                crossing, and a rising reflected ray crosses the ground in
+--                FRONT of a sprite's feet before it ever reaches the screen
+--                pixels the sprite covers -- it is above both by then. So
+--                what a sprite actually needs is for its OWN pixels to be
+--                where that first crossing lands, and that is true only at
+--                the waterline. Measured headless against this mod's camera,
+--                curve and lean over the bridge on Route 104: of ~100,000
+--                water pixels marched, a figure standing on the bridge deck
+--                reflects on 0 of them and one standing at the water's edge
+--                on 6 (both derived). A walker one tile inland does not
+--                reflect, whatever is behind it.
+--
+--                That is the honest screen-space answer and it is left
+--                honest. The fix would be giving sprites their own depth in
+--                the mirror, which is the thing the paragraph above already
+--                refuses, for the reason it gives.
+--
 --                WATER SPRITES is the row that decides whether this half
 --                happens at all (Water.castSetting below). It is the only
 --                part of the reflection whose cost is DRAW CALLS rather
@@ -237,6 +257,95 @@ end
 function Water.reflectCast()
   return Water.castLevel() > 0
 end
+
+-- ------- the planar mirror's own row
+--
+-- WHAT IT BUYS, and why it is a row and not a fix. The march above cannot
+-- reflect a person standing beside the water -- not "usually cannot", cannot:
+-- it stops at the FIRST crossing and a rising reflected ray clears the ground
+-- in front of a figure's feet before it reaches the figure's own pixels.
+-- DERIVED, over the bridge on Route 104 with this mod's camera, curve and
+-- lean: of ~100,000 water pixels, a figure on the bridge deck reflects on 0
+-- and one at the very waterline on 6. The header states this at length. The
+-- only answer is to draw the world AGAIN with its Y flipped in the water
+-- plane and let the rasteriser find them (Voxel3D.beginPlanar).
+--
+-- WHAT IT COSTS is a whole second scene: every terrain mesh, the neighbours,
+-- the grass, the flowers and every character card, into a canvas the size of
+-- the frame, with its own depth buffer. MEASURED in the real renderer under
+-- xvfb (software GL, so the absolute times are the box's and only the RATIO
+-- travels) -- see FINDINGS for the table.
+--
+-- OFF BY DEFAULT, which is the whole reason this is a row. It is not a
+-- refinement of the water the way FULL is a refinement of SKY: it is the
+-- frame drawn twice, and it is the only thing in this mod that can be said
+-- of. Every other row in the mode defaults to what the mode has always
+-- drawn; this one adds something the mode has never drawn, at a price
+-- nothing else in it charges, so the player turns it ON rather than
+-- discovering they have been paying for it. The owner asked for it
+-- explicitly so that it could be turned off -- a row that defaults on is a
+-- row nobody asked to be able to turn off.
+--
+-- NOT OFFERED BELOW FULL, exactly like WATER SPRITES and for the same
+-- reason: the shader's `planarOn` is only ever sent above 0 where `rays` is,
+-- and a row that decides nothing is worse than no row.
+Water.PLANAR_KEY = "waterplanar"
+Water.PLANAR_LABEL = "WATER MIRROR"
+
+Water.planarSetting = ModSetting.new(Water.PLANAR_KEY, Water.PLANAR_LABEL,
+                                     { false, true },
+                                     { "OFF", "ON" })
+
+-- 1 = render the mirrored scene this frame, 0 = do not.
+--
+-- A NUMBER rather than a boolean so it goes through Tier.clamp, which is how
+-- every other ceiling in this mod is spent (ShadowMap.available, Water.level,
+-- Water.castLevel, AntiAlias.samples) and which clamps numbers only.
+function Water.planarLevel()
+  -- Below FULL nothing samples the mirror: the shader reaches `planarTex`
+  -- only inside the same branch `rays` guards, so a pass here would render a
+  -- whole scene into a texture no fragment reads. That is not a look
+  -- decision, it is the dead work Water.castLevel already refuses.
+  if Water.level() < 2 then return 0 end
+  local lv = Water.planarSetting:get() and 1 or 0
+  -- A CEILING, NOT A SETTING -- the same contract Water.level states. This
+  -- one is NOT redundant against today's CAPS the way `waterCast` is: it is
+  -- the most expensive thing the mode can be asked to do, and a tier that
+  -- allows the march may still not allow the frame twice.
+  return clampTier("waterPlanar", lv)
+end
+
+function Water.reflectPlanar()
+  return Water.planarLevel() > 0
+end
+
+-- HOW FAR A SHEET MAY STAND OFF THE PASS'S PLANE AND STILL TAKE ITS PICTURE.
+--
+-- Half a world pixel. The gate is meant to be an EQUALITY -- a sheet is at
+-- the plane or it is not -- and the slack exists only for the arithmetic:
+-- the plane is chosen in Lua from TileShape's own heights and the fragment
+-- recovers its sheet by adding the bend back onto an interpolated varying,
+-- so the two agree to floating-point error and nothing else.
+--
+-- It is deliberately far below the smallest real gap. The closest two water
+-- surfaces ever stand in Hoenn is 2 world pixels (the water class's own
+-- recess against a sheet sitting on a terrace), and the gap this exists to
+-- refuse is the 14 pixels between Route 104's two ponds -- which reflected
+-- about the wrong plane would be displaced by twice that.
+Water.PLANE_TOL = 0.5
+
+-- HOW HARD THE WAVES DRAG THE PLANAR LOOKUP, as a fraction of the frame.
+--
+-- STATED, not derived, and small on purpose. This is the one place the
+-- planar reflection can be made to lie: the sample is exact at zero, and
+-- every texel of wobble drags the reflection off the thing casting it. The
+-- sky and the sun already break along the bars out of the wave NORMAL, which
+-- costs nothing because they are a function of direction; a screen-space
+-- reflection has a fixed place on the canvas and moving it moves the
+-- picture. 1/400th of the frame is about three pixels at 1280 wide -- under
+-- a world pixel at this mode's usual zoom, which is the point: it should
+-- read as the surface being water, never as the reflection being loose.
+Water.PLANAR_WAVE = 0.0025
 
 -- ------- the look, in constants
 --
@@ -503,6 +612,35 @@ Water.RAY_GROW = 1.18
 -- classic screen-space smear, where a tree between the camera and the pond
 -- paints itself across the water -- and this is the test that drops it.
 Water.RAY_THICK = 1.6
+-- THE SLACK THE CROSSING TEST ALLOWS, and why the march needs one at all.
+--
+-- Under the world curve the water meshes are drawn once BEFORE this pass,
+-- flat and with depth writes on, so a far sheet cannot paint over a near one
+-- (see VoxelScene.drawWater). That prepass puts the WATER SURFACE into the
+-- depth texture the march reads -- and the march's ray starts ON that
+-- surface, so its first steps are the surface compared against ITSELF.
+--
+-- Which is a comparison that cannot be exact: the buffer holds depth
+-- interpolated linearly in screen space over a quad, the march recomputes it
+-- by projecting a world point, and the two drift apart across a quad's
+-- interior. Where the rasterised water lands a hair NEARER than the ray just
+-- above it, the step reads as a crossing, fails the rayThick test a line
+-- later, and the whole ray is thrown away -- so the pixel answers sky.
+--
+-- MOTIVATED BY THE BRIDGE OVER THE WATER ON ROUTE 104, which is the frame
+-- this was reported from: a bridge over open water with the far bank behind
+-- it, and no shoreline anywhere in the lake. Measured headless against the
+-- mod's own camera, curve and lean, the top rung threw away a THIRD of every
+-- water pixel this way (33.13% of them, derived) and reached the shore on
+-- 1.45%; with the slack it reaches it on 2.35%.
+--
+-- The number is the fragment's own: the self-test a few hundred lines below
+-- discards water behind an occluder with exactly this slack, for exactly
+-- this drift, and states at length why it clears the drift while still
+-- catching every occluder -- anything genuinely in front of a water pixel is
+-- whole world units nearer, upward of 1e-3 in depth. STATED, not derived:
+-- the two are one fact and are kept at one value.
+Water.RAY_BIAS = 2e-4
 Water.EDGE_FADE = 0.14         -- reflection eased off over this much of the frame
 
 -- ------- the shader
@@ -616,6 +754,18 @@ uniform Image reflectTex;
 uniform LOVE_HIGHP_OR_MEDIUMP Image depthTex;
 
 uniform float rays;          // 0 = sky only, 1 = march the screen too
+// THE PLANAR MIRROR (Voxel3D.beginPlanar): the world drawn a second time
+// upside down under one plane, and which plane that was.
+//
+//   planarOn   0 = no pass ran this frame; nothing below reads planarTex
+//   planarY    the surface height it was rendered for, in the FLAT world
+//   planarTol  how far a sheet may stand off that height and still take it
+//   planarWave how hard the wave slope drags the lookup across the texture
+uniform Image planarTex;
+uniform float planarOn;
+uniform float planarY;
+uniform float planarTol;
+uniform float planarWave;
 uniform vec3 lookFlat;       // the way the horizon lies from this camera
 uniform float lean;          // and how far the reflection tilts toward it
 uniform float leanElev;      // the elevation it aims at, in radians
@@ -852,18 +1002,27 @@ vec4 march(vec3 origin, vec3 dir) {
     if (pb.w < 0.5) return miss;
     if (pb.x < 0.0 || pb.x > 1.0 || pb.y < 0.0 || pb.y > 1.0) return miss;
     float scene = Texel(depthTex, pb.xy).r;
-    if (pb.z > scene) {
+    // RAY_BIAS, because under the curve this buffer holds the WATER too and
+    // the ray starts on it -- the surface against itself, to within the
+    // drift the fragment's own self-test already allows for (see RAY_BIAS in
+    // Water.lua; the bridge over the water on Route 104 is the frame it was
+    // reported from). A genuine occluder is whole world units nearer, so
+    // nothing real is lost to it.
+    if (pb.z > scene + RAY_BIAS) {
       // how much depth this one step covered: the yardstick for whether
       // the crossing is a surface or a thin thing the ray shot past
       float span = max(abs(pb.z - pa.z), 1e-7);
-      if (pb.z - scene > span * rayThick) return miss;
+      if (pb.z - scene - RAY_BIAS > span * rayThick) return miss;
       // binary-refine onto the contact
       vec3 lo = a;
       vec3 hi = b;
       for (int k = 0; k < RAY_REFINE; k++) {
         vec3 m = (lo + hi) * 0.5;
         vec4 pm = project(m);
-        if (pm.z > Texel(depthTex, pm.xy).r) { hi = m; } else { lo = m; }
+        // the same slack the crossing above was found with, or the
+        // halvings converge on a different surface than the one that was hit
+        if (pm.z > Texel(depthTex, pm.xy).r + RAY_BIAS) { hi = m; }
+        else { lo = m; }
       }
       vec4 hit = project(hi);
       if (hit.w < 0.5) return miss;
@@ -1196,6 +1355,61 @@ vec4 effect(mediump vec4 color, Image tex, mediump vec2 tc, mediump vec2 sc) {
     vec4 hit = march(surf, r);
     refl = mix(refl, hit.rgb, hit.a);
   }
+  // ...AND THE PLANAR MIRROR OVER THE TOP OF BOTH.
+  //
+  // THE ORDER IS THE RULE, and it is this way round because the three
+  // layers are ranked by what they can SEE, not by how they look. The sky
+  // answers everywhere and knows nothing about the world. The march knows
+  // the world, but only the part of it that is on screen, and only as far
+  // as its first crossing -- which is why 87% of a lake resolves to sky
+  // (rays leaving the frame, DERIVED) and why a figure standing on the
+  // bridge deck on Route 104 reflects on 0 of ~100,000 water pixels
+  // (DERIVED; see the header). The planar pass knows the world as
+  // GEOMETRY: things standing on the ground, things off the top of the
+  // frame, things the march walked straight past. So where it has an
+  // answer it is the better one, and it goes last.
+  //
+  // TWO GATES, both of which must pass, and neither is a fudge:
+  //
+  //   THE PLANE. The pass was rendered for ONE height and the surface is
+  //   not one height -- Route 104 carries three and Route 120 five
+  //   (DERIVED, over every water-bearing layout in Hoenn). A sheet at a
+  //   different height would take this texture and show the world reflected
+  //   about someone else's plane, displaced by twice the difference: on
+  //   Route 104 that is 2 x 14 = 28 world pixels, nearly two tiles. So a
+  //   fragment whose own flat sheet is not AT the plane declines, and keeps
+  //   the march and the sky it already had. Measured, one plane per frame
+  //   covers 98.9% of the water on screen on Route 104, 93.3% in Lilycove
+  //   and 85.8% on Route 120 (DERIVED); the rest is not wrong, it is
+  //   yesterday's picture.
+  //
+  //   THE ALPHA. The mirror was cleared to transparent black, so alpha is
+  //   how it says "I saw nothing here" -- open sky over the far shore, or
+  //   a fragment the clip plane threw away. Sky in the mirror must fall
+  //   through to the PAINTED sky, which is the band ramp read at the
+  //   reflected ray's own elevation and is a better picture than a black
+  //   hole in the lake.
+  //
+  // THE LOOKUP IS THE FRAGMENT'S OWN SCREEN POSITION, which is the whole
+  // economy of a planar reflection: with the geometry mirrored in the plane
+  // and drawn through the SAME matrix, the reflection of a point lands on
+  // exactly the screen pixel where the mirror shows it. No march, no depth
+  // read, one texture fetch.
+  //
+  // ...nudged by the wave slope, so the reflection breaks along the bars
+  // the way the sky and the sun already do. The nudge is in SCREEN space
+  // and is deliberately small: it is a stylisation of refraction, and a
+  // large one would drag a reflection off the thing casting it.
+  if (planarOn > 0.5 && abs(sheet.y - planarY) <= planarTol) {
+    vec2 puv = uv + n.xz * planarWave;
+    vec4 pr = Texel(planarTex, clamp(puv, vec2(0.0), vec2(1.0)));
+    // eased off at the frame's rim on the same measure the march uses: a
+    // mirrored world ends at the edge of its canvas, and a reflection that
+    // simply stops draws a line across the lake
+    vec2 pe = min(uv, 1.0 - uv);
+    float pedge = smoothstep(0.0, edgeFade, min(pe.x, pe.y));
+    refl = mix(refl, pr.rgb, pr.a * pedge);
+  }
 
   // Schlick, floored and softened (see FRESNEL_* in Water.lua): the angle
   // still decides, a grazing camera still gets a mirror, and a steep one
@@ -1265,9 +1479,13 @@ local function source(grid)
   local src = SHADER_SRC:gsub("//@CRATERS", (craterSource():gsub("%%", "%%%%")))
   src = src:gsub("//@TRAINS", (trainSource():gsub("%%", "%%%%")))
   local head = ("#define RAY_STEPS %d\n#define RAY_REFINE %d\n"
-                .. "#define WAVE_STEPS %d\n#define WAVE_STRIDE %.1f\n")
+                .. "#define WAVE_STEPS %d\n#define WAVE_STRIDE %.1f\n"
+                -- compiled in rather than sent, like the step bounds beside
+                -- it: a uniform that failed to send would silently take the
+                -- slack back to zero, which is the bug this is here to fix
+                .. "#define RAY_BIAS %.6f\n")
     :format(Water.RAY_STEPS, Water.RAY_REFINE, Water.WAVE_STEPS,
-            Water.WAVE_STRIDE)
+            Water.WAVE_STRIDE, Water.RAY_BIAS)
   if grid then head = head .. "#define VOXEL_GRID 1\n" end
   return head .. src
 end
@@ -1329,6 +1547,8 @@ Water._waveTime = waveTime
 --
 --   reflect   the frame so far, as a texture (Voxel3D.beginWater)
 --   depth     its depth, likewise
+--   planar    the mirrored scene, or nil (Voxel3D.beginPlanar)
+--   planarY   the plane it was rendered for, in the flat world
 --   vp, eye, curve, screen, cell   the camera, as beginScene sent it
 --   skyEdge   where the sky's bottom is, or nil indoors / with no bands
 --   grid      whether the voxel wireframe is compiled into this frame
@@ -1375,6 +1595,19 @@ function Water.begin(ctx)
   send("dayTint", Voxel3D.tint or { 1, 1, 1 })
 
   send("rays", level >= 2 and 1 or 0)
+  -- THE PLANAR MIRROR, or the switch that says there is not one.
+  --
+  -- planarTex is bound EITHER WAY. A declared sampler left unbound is a
+  -- driver-dependent crash rather than a fallback -- the same rule sunMap
+  -- and skyRamp are sent under a few lines above and below -- so when no
+  -- pass ran this frame the frame copy stands in and `planarOn` at 0 keeps
+  -- every fragment out of the branch that would read it.
+  local planar = (level >= 2) and ctx.planar or nil
+  send("planarTex", planar or ctx.reflect)
+  send("planarOn", planar and 1 or 0)
+  send("planarY", tonumber(ctx.planarY) or 0)
+  send("planarTol", Water.PLANE_TOL)
+  send("planarWave", Water.PLANAR_WAVE)
   -- the horizon lean, and the direction it leans toward (see Water.lean)
   send("lookFlat", ctx.lookFlat or { 0, 0, -1 })
   send("lean", Water.lean(ctx.descent))

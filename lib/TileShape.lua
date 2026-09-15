@@ -191,17 +191,51 @@ local FALLBACK_HEIGHTS = {
   -- without that pass gets one honest course rather than nothing.
   carcass = 16,
   -- A KITCHEN UNIT: counter height, with its front panel standing.
-  worktop = 18,
-  -- A SINK is the same carcass with a basin in its top.
-  sink = 18,
+  --
+  -- SIXTEEN, not eighteen (g3-cabinet-302).  IN-GAME LOCATION: the kitchen
+  -- run in LITTLEROOT TOWN, BrendansHouse_1F (1..2, 2) -- "as well as the
+  -- sink should be like a counter height".  DERIVED from the stated 32px
+  -- walker (SpriteBillboards.buildCardStated): waist is half a standing
+  -- figure, which is the number `counter` already carries and ships on 638
+  -- cells.  18 was neither -- it was a hair over waist and nothing said so.
+  worktop = 16,
+  -- A SINK is the same carcass with a basin in its top -- and the SAME unit:
+  -- 569 (sink) and 570 (worktop) are one drawing with one lid line across
+  -- them, so they take one height or there is a full course of step in the
+  -- middle of one worktop.
+  sink = 16,
   -- A FRIDGE. Two cells of drawing -- the door above, the body below -- and
   -- one box: the mesher's authored-upright fold walks NORTH up the column,
   -- so the front cell wears its own art low and the wall cell's art high.
-  appliance = 30,
-  -- A DRESSER or a glass-fronted cabinet: shoulder height, not ceiling.
-  cabinet = 26,
-  -- A TELEVISION on its stand, and the console beside it.
-  tv = 22,
+  --
+  -- THIRTY-TWO (g3-cabinet-302).  DERIVED off the layout rather than picked:
+  -- the two cells ARE the object, a cell is 16 world pixels, so the drawing
+  -- is 32 world pixels of fridge -- which is also the stated 32px walker, and
+  -- a fridge is as tall as a person.  32 is what the cell already measured
+  -- (Structures.standGen3Furniture stands a carcass one course per drawn
+  -- row); 30 was the class disagreeing with the pass in silence.
+  appliance = 32,
+  -- A DRESSER or a glass-fronted cabinet.  IN-GAME LOCATION: the glass
+  -- cabinet in LITTLEROOT TOWN, BrendansHouse_1F (3..4, 2) with its upper
+  -- shelves at (3..4, 1) -- "make the glass cabinet 3d as well inclduing the
+  -- lower half".  THIRTY-TWO, DERIVED the same way the fridge above is: two
+  -- drawn rows at 16 world pixels each.  "Shoulder height, not ceiling" was
+  -- a reading of the picture rather than a measurement of it, and it
+  -- disagreed with the 32 the cell actually stood at.
+  cabinet = 32,
+  -- NOT a television, whatever the name says -- see the note beside
+  -- `JOINERY_H` in lib/Structures.lua.  MEASURED over all 518 maps: this
+  -- class resolves on exactly five cells in Hoenn, metatiles 576/577 (the
+  -- white cabinet in both children's living rooms) and 614 (the game
+  -- system's lower cell in both bedrooms), and not one of them carries
+  -- MB_TELEVISION -- Emerald's own televisions are behaviour 0x86 and
+  -- resolve `console`.  All five are a lid over a front band, which is a
+  -- TABLE, and the report asks for exactly that: "the white box next to the
+  -- tv should be table height and the whiter part is the top".  TWELVE, the
+  -- `tabletop` number, for the `tabletop` reason.  The name is left alone
+  -- because the pins that use it live in data/gen3_shapes.lua, which is not
+  -- this round's to edit; the honest thing is to say here what it is.
+  tv = 12,
   bridge = 4,
   -- A FLOATING LOG.  Pacifidlog's rafts ride on the sea rather than over it,
   -- and the town draws each one in three vertical states (floating, half

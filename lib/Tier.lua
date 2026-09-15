@@ -123,13 +123,32 @@ end
 --              already calls it "the most expensive row in the mod": 2X is
 --              half again as many pixels in each direction and 4X twice, on
 --              every pass in the frame including the sun's.
+--   waterPlanar the top rung of Water.planarLevel(): 1 renders the whole
+--              scene a SECOND time, mirrored in the water plane, so that
+--              people standing beside a lake are in it -- which the
+--              screen-space march provably cannot do (0 of ~100,000 water
+--              pixels for a figure on Route 104's bridge deck, DERIVED).
+--              The most expensive thing this mod can be asked for: it is not
+--              fill rate OR draw calls, it is the frame again -- every
+--              terrain mesh, the grass, the flowers and every card, into a
+--              full-size colour canvas with its own depth buffer.
+--
+--              UNLIKE `waterCast` THIS CEILING IS NOT REDUNDANT. That one
+--              only ever repeats what the `water` ceiling already said; this
+--              one is an independent fact. A tier that can afford the march
+--              -- twenty-odd texture reads on the water's own pixels -- may
+--              still be nowhere near able to afford the scene twice, and
+--              HIGH is exactly such a tier on a laptop. It is nil here
+--              anyway, because the row itself is OFF by default (see
+--              Water.planarLevel): what a tier must never do is turn a
+--              player's OWN choice on, and a ceiling cannot.
 local CAPS = {
   high     = { shadows = true,  shadowRes = nil,  shadowHz = nil,
-               water = nil, waterCast = nil, aa = nil },
+               water = nil, waterCast = nil, waterPlanar = nil, aa = nil },
   balanced = { shadows = true,  shadowRes = 1024, shadowHz = 3,
-               water = 1,   waterCast = 0,   aa = 2 },
+               water = 1,   waterCast = 0,   waterPlanar = 0,   aa = 2 },
   low      = { shadows = false, shadowRes = 1024, shadowHz = 0,
-               water = 0,   waterCast = 0,   aa = 0 },
+               water = 0,   waterCast = 0,   waterPlanar = 0,   aa = 0 },
 }
 
 -- Bumped whenever the resolved tier changes. Nothing in the mod needs to

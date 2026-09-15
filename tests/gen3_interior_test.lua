@@ -1,7 +1,21 @@
 -- Interiors: metatile pins, and the elevation that is not height.
 -- Runs against the REAL Brendan's House layouts out of the extracted data.
-package.path = "/tmp/work/?.lua;/tmp/work/?/init.lua;" .. package.path
-local MOD = "/tmp/modwork/DRAMATIC_SHAPE/"
+-- The engine tree this suite runs against.  Defaults to the current
+-- directory, so the suite runs from a repository checkout on any
+-- machine; override with ENGINE=... to point it somewhere else.  It
+-- used to name a scratch directory that exists only on one
+-- contributor's box, which meant this suite loaded src/* from THAT
+-- tree no matter what MOD said.
+local ENGINE = os.getenv("ENGINE") or "."
+package.path = ENGINE .. "/?.lua;" .. ENGINE .. "/?/init.lua;" .. package.path
+-- The mod under test.  Defaults to the tree this suite ships in, so the
+-- suite runs from a checkout on any machine; override with MOD=... to
+-- point it somewhere else.  It used to name a scratch directory that
+-- exists only on one contributor's box, so four of the six suites were
+-- silently measuring a stale copy -- and reported green while the tree
+-- they were meant to cover was failing.
+local MOD = os.getenv("MOD") or "mods/DRAMATIC_SHAPE"
+if MOD:sub(-1) ~= "/" then MOD = MOD .. "/" end
 local GEN = "/mnt/user-data/uploads/Gen2Recomp/emerald/data/generated/"
 _G.love = require("tests.love_stub")
 
@@ -125,7 +139,13 @@ do
   local _, s = classAtCell(m2, shapes2, 1, 4)
   ok(s.art == "top", "drawn from above")
   ok(s.h > 0 and s.h < 12, "and low (" .. tostring(s.h) .. ")")
-  eq(classAtCell(m2, shapes2, 3, 2), "tv", "the television stands on its own")
+  -- (3,2) IS THE GAME SYSTEM, metatile 614 -- not the television.  The
+-- label below said "television" from before the two were told apart:
+-- the real set is metatile 2 of gTileset_Building (MB_TELEVISION),
+-- and class `tv` is the white box beside it.  Reported from play,
+-- "make the gamesystem a 2d sprite", so 614/615 are pinned `cutout`
+-- and build one world pixel thick.  The assertion follows the pin.
+  eq(classAtCell(m2, shapes2, 3, 2), "cutout", "the game system is a flat sprite")
   local _, t = classAtCell(m2, shapes2, 3, 2)
   ok(t.authored == true, "authored, so it does not drag the wall forward")
   eq(classAtCell(m2, shapes2, 0, 2), "chair", "and the stool is a stool")

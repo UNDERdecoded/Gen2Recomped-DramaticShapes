@@ -1,7 +1,7 @@
 {
   "id": "Gen2Recomped-DramaticShapes",
   "name": "Gen2Recomped-DramaticShapes Voxel Mod",
-  "version": "0.7.40",
+  "version": "0.7.56",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
